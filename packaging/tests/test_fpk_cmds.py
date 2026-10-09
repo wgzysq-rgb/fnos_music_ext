@@ -145,6 +145,8 @@ esac
             "FNMUSIC_DURABLE_LOG": str(self.durable_log),
             "FNMUSIC_UNIT_FILE": str(self.tmp / "absent-unit.service"),
             "FNMUSIC_DEPLOYMENT_FILE": str(self.tmp / "absent-deployment"),
+            # 音源快照落点同样沙箱化：生产路径 /var/lib/fnmusic-ext 不得被测试触碰
+            "FNMUSIC_SOURCE_SNAPSHOT": str(self.tmp / "state" / "installed-source"),
             "HOME": str(self.tmp),
         }
         env.update({k: v for k, v in extra.items() if v is not None})
@@ -164,6 +166,11 @@ esac
         if not self.install_log.exists():
             return []
         return self.install_log.read_text(encoding="utf-8").splitlines()
+
+    @property
+    def snapshot(self) -> Path:
+        """已安装音源的持久快照路径（与 env() 里注入的 FNMUSIC_SOURCE_SNAPSHOT 一致）。"""
+        return self.tmp / "state" / "installed-source"
 
 
 @pytest.fixture
@@ -204,15 +211,31 @@ def test_common_repo_dir_precedence(sb):
 
 
 def test_common_saved_source_priority(sb):
-    """.env 三布尔→--sources：musicbox > lxmusic > musicdl，未配置为空。"""
+    """.env 三布尔→--sources：musicbox > lxmusic > musicdl，未配置为空。
+
+    值格式必须兼容真实写法：install.sh 与 WebUI 都经 env_merge.quote_env_value 写成
+    ``FNMUSIC_LX_ENABLED='true'``。此前实现只认裸 ``KEY=true``，真实 .env 恒不匹配，
+    升级/重装就把用户选好的音源静默重置回 musicdl（推荐歌单曲目是 lx: 形态 → 取流 404）。
+    """
     cases = [
-        ("FNMUSIC_NETEASE_ENABLED=true\n", "musicbox"),
-        ("FNMUSIC_LX_ENABLED=true\n", "lxmusic"),
+        # 真实格式（单引号包裹）
+        ("FNMUSIC_NETEASE_ENABLED='true'\n", "musicbox"),
+        ("FNMUSIC_LX_ENABLED='true'\n", "lxmusic"),
+        ("FNMUSIC_MUSICDL_ENABLED='true'\n", "musicdl"),
+        # 手工编辑的其它写法：双引号 / export 前缀 / 1 / yes
+        ('export FNMUSIC_LX_ENABLED="true"\n', "lxmusic"),
+        ("export FNMUSIC_MUSICDL_ENABLED=1\n", "musicdl"),
+        ("FNMUSIC_NETEASE_ENABLED='yes'\n", "musicbox"),
+        # 大写 + CRLF 行尾（本仓库历史上出现过 CRLF 污染）：\r 不得混进布尔判定
+        ("FNMUSIC_LX_ENABLED='TRUE'\r\n", "lxmusic"),
+        # 裸值写法（历史版本）
         ("FNMUSIC_MUSICDL_ENABLED=true\n", "musicdl"),
         # 三者并存取最高优先级，避免升级后源漂移
-        ("FNMUSIC_NETEASE_ENABLED=true\nFNMUSIC_LX_ENABLED=true\nFNMUSIC_MUSICDL_ENABLED=true\n", "musicbox"),
-        ("FNMUSIC_LX_ENABLED=true\nFNMUSIC_MUSICDL_ENABLED=true\n", "lxmusic"),
-        ("FNMUSIC_MUSICDL_ENABLED=false\n", ""),
+        ("FNMUSIC_NETEASE_ENABLED='true'\nFNMUSIC_LX_ENABLED='true'\nFNMUSIC_MUSICDL_ENABLED='true'\n", "musicbox"),
+        ("FNMUSIC_LX_ENABLED='true'\nFNMUSIC_MUSICDL_ENABLED='true'\n", "lxmusic"),
+        # 关闭状态 / 未配置 → 空
+        ("FNMUSIC_MUSICDL_ENABLED='false'\n", ""),
+        ("FNMUSIC_MUSICDL_ENABLED='true'\nFNMUSIC_LX_ENABLED='false'\n", "musicdl"),
         ("", ""),
     ]
     script = (f'set -uo pipefail\nSELF_DIR="{sb.cmd}"\n. "{sb.cmd}/_common"\n'
@@ -227,14 +250,21 @@ def test_common_saved_source_priority(sb):
 
 
 def test_common_saved_lx_url(sb):
-    sb.make_repo(env_text="LX_SOURCE_URL=http://s/x.js\nOTHER=1\n")
+    """LX_SOURCE_URL 取最后一处赋值，并剥掉引号（带引号会让 install.sh 误判为本机路径）。"""
     script = (f'set -uo pipefail\nSELF_DIR="{sb.cmd}"\n. "{sb.cmd}/_common"\n'
               'printf \'%s\' "$(fnmusic_saved_lx_url)"\n')
+    # 真实格式：单引号包裹（install.sh 与 WebUI 均如此）
+    sb.make_repo(env_text="LX_SOURCE_URL='http://s/x.js'\nOTHER=1\n")
     out = sb.bash(script)
     assert out.returncode == 0, out.stderr
     assert out.stdout == "http://s/x.js"
+    # 裸值写法同样可用
+    sb.make_repo(env_text="LX_SOURCE_URL=http://bare/x.js\n")
+    assert sb.bash(script).stdout == "http://bare/x.js"
+    sb.make_repo(env_text="export LX_SOURCE_URL='file:///data/lxmusic/uploads/a.js'\n")
+    assert sb.bash(script).stdout == "file:///data/lxmusic/uploads/a.js"
     # 重复键取最后一行（env_merge 增量合并的既有形态）
-    sb.make_repo(env_text="LX_SOURCE_URL=http://old/x.js\nLX_SOURCE_URL=http://new/y.js\n")
+    sb.make_repo(env_text="LX_SOURCE_URL='http://old/x.js'\nLX_SOURCE_URL='http://new/y.js'\n")
     out = sb.bash(script)
     assert out.returncode == 0, out.stderr
     assert out.stdout == "http://new/y.js"
@@ -366,6 +396,101 @@ def test_install_callback_lx_skip_verify_off_by_default(sb):
     assert result.returncode == 0, result.stderr
     assert sb.install_args() == [
         "--non-interactive --sources lxmusic --webui --adopt --lx-source-url http://s/y.js --extend"]
+
+
+# --- 重装/升级必须保住已安装音源（2026-10-09 回归：重装 FPK 后音源被重置回 musicdl） ---
+#
+# install.sh 把 FNMUSIC_MUSICDL_ENABLED / FNMUSIC_LX_ENABLED 当作「安装时部署选项」，
+# 永远以本次安装的值覆盖 .env；向导字段又是 required + initValue=musicdl，而
+# _common 读 .env 时曾只认裸 KEY=true（真实 .env 是 KEY='true'）→ saved_source 恒为空 →
+# 同版本重装/覆盖安装一律回落 musicdl 聚合音源。用户现象：在线搜索还能放，推荐歌单
+# 曲目 id 是 lx: 形态，音源非 lx 时取流直接 404 → App 一播就跳下一首。
+
+def test_install_callback_keeps_installed_lx_over_wizard_default(sb):
+    """已装洛雪源 + 向导默认提交 musicdl → 仍按 lxmusic 安装，并带上源地址、跳过校验。"""
+    sb.make_repo(env_text="FNMUSIC_LX_ENABLED='true'\n"
+                          "FNMUSIC_MUSICDL_ENABLED='false'\n"
+                          "LX_SOURCE_URL='http://s/lx.js'\n")
+    result = sb.run("install_callback", wizard_sources="musicdl", wizard_extend="true")
+    assert result.returncode == 0, result.stderr
+    assert sb.install_args() == [
+        "--non-interactive --sources lxmusic --webui --adopt"
+        " --lx-source-url http://s/lx.js --lx-skip-verify --extend"]
+    # 期望值与采纳值都要留痕，便于用户发现「向导选了别的、实际沿用了已装音源」
+    durable = sb.durable_log.read_text(encoding="utf-8")
+    assert "musicdl" in durable and "lxmusic" in durable
+
+
+def test_install_callback_keeps_installed_source_from_snapshot(sb):
+    """repo/.env 已被重装流程清空时，用 install_init 留下的持久快照兜底，不得回落 musicdl。"""
+    sb.make_repo()
+    sb.snapshot.parent.mkdir(parents=True, exist_ok=True)
+    sb.snapshot.write_text("lxmusic\n", encoding="utf-8")
+    result = sb.run("install_callback", wizard_sources="musicdl")
+    assert result.returncode == 0, result.stderr
+    assert sb.install_args() == [
+        "--non-interactive --sources lxmusic --webui --adopt --lx-skip-verify --extend"]
+
+
+def test_install_callback_fresh_install_uses_wizard_source(sb):
+    """首次安装（无 .env、无快照）时向导值生效；洛雪源不追加 skip-verify（源尚未被验证过）。"""
+    sb.make_repo()
+    result = sb.run("install_callback", wizard_sources="musicbox")
+    assert result.returncode == 0, result.stderr
+    assert sb.install_args() == ["--non-interactive --sources musicbox --webui --adopt --extend"]
+
+    shutil.rmtree(sb.appdest / "repo")
+    sb.make_repo()
+    result = sb.run("install_callback", wizard_sources="lxmusic", wizard_lx_url="http://s/y.js")
+    assert result.returncode == 0, result.stderr
+    assert sb.install_args() == [
+        "--non-interactive --sources lxmusic --webui --adopt --lx-source-url http://s/y.js --extend"]
+
+
+def test_install_init_snapshots_installed_source(sb, tmp_path, held_socket):
+    """install_init 在新包落盘前把已安装音源写入持久快照（重装兜底的数据来源）。"""
+    sb.add_docker()
+    _socket_variant(sb, held_socket)
+    sb.make_repo(env_text="FNMUSIC_LX_ENABLED='true'\n")
+    assert sb.run("install_init").returncode == 0
+    assert sb.snapshot.read_text(encoding="utf-8").strip() == "lxmusic"
+    # 未配置音源（全新安装）时不写快照，也不得报错
+    sb.snapshot.unlink()
+    sb.make_repo(env_text="FNMUSIC_LX_ENABLED='false'\n")
+    assert sb.run("install_init").returncode == 0
+    assert not sb.snapshot.exists()
+    # 仓库缺失（首次安装尚无 repo）时静默跳过
+    shutil.rmtree(sb.appdest / "repo")
+    assert sb.run("install_init").returncode == 0
+    assert not sb.snapshot.exists()
+
+
+def test_uninstall_callback_clears_source_snapshot(sb):
+    """卸载清空安装期状态：此后重新安装应回到向导的「初始音源」，不被旧快照顶替。"""
+    sb.make_repo(env_text="X=1\n")
+    sb.snapshot.parent.mkdir(parents=True, exist_ok=True)
+    sb.snapshot.write_text("lxmusic\n", encoding="utf-8")
+    result = sb.run("uninstall_callback")
+    assert result.returncode == 0, result.stderr
+    assert not sb.snapshot.exists()
+
+
+def test_common_snapshot_source_prefers_env_then_snapshot(sb):
+    """.env 最新（管理页切源写这里）优先；.env 无记录时用快照；非法内容视为无记录。"""
+    script = (f'set -uo pipefail\nSELF_DIR="{sb.cmd}"\n. "{sb.cmd}/_common"\n'
+              'printf \'%s\' "$(fnmusic_snapshot_source)"\n')
+    sb.make_repo(env_text="FNMUSIC_MUSICDL_ENABLED='true'\n")
+    sb.snapshot.parent.mkdir(parents=True, exist_ok=True)
+    sb.snapshot.write_text("lxmusic\n", encoding="utf-8")
+    assert sb.bash(script).stdout == "musicdl"
+    # .env 已无音源记录（被重装清掉）→ 用快照
+    sb.make_repo(env_text="FNMUSIC_LX_ENABLED='false'\n")
+    assert sb.bash(script).stdout == "lxmusic"
+    # 快照内容非法（手工改坏/半截写入）→ 视为无记录，交给调用方回落
+    sb.snapshot.write_text("bogus\n", encoding="utf-8")
+    assert sb.bash(script).stdout == ""
+    sb.snapshot.unlink()
+    assert sb.bash(script).stdout == ""
 
 
 def test_install_callback_install_failure_tails_log(sb):

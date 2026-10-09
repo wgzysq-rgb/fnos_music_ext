@@ -9,4 +9,11 @@ command -v docker >/dev/null 2>&1 || fnmusic_fail "未检测到 Docker：请在�
 docker info >/dev/null 2>&1 || fnmusic_fail "Docker 服务未运行：请在应用中心启动 Docker 后重试"
 [ -S /var/run/trim_music.socket ] || [ -S /var/run/trim_music_upstream.socket ] || fnmusic_fail "未检测到官方\"飞牛音乐\"：请先在应用中心安装并启动飞牛音乐"
 
+# 重装保护：本钩子在新包文件落盘**之前**执行，此刻 repo/.env 还是上一份完整配置。
+# 把已安装音源快照到应用目录之外，供 install_callback 在 .env 被重建/清空时沿用
+# （否则重装会把用户选好的洛雪自定义源静默重置回 musicdl 聚合音源，详见 _common）。
+if [ -n "${FNMUSIC_REPO_DIR}" ]; then
+    fnmusic_write_source_snapshot "$(fnmusic_saved_source)"
+fi
+
 exit 0

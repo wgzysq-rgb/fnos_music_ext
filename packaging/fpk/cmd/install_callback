@@ -7,11 +7,37 @@ SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 [ -n "${FNMUSIC_REPO_DIR}" ] || fnmusic_fail "应用文件缺失（install.sh 不存在）"
 
+# 音源：本机已安装时**一律沿用已安装音源**，向导值只对首次安装生效。
+#
+# 为什么必须这样（实测回归）：install.sh 把 FNMUSIC_MUSICDL_ENABLED /
+# FNMUSIC_LX_ENABLED 当作「安装时部署选项」，永远以本次安装的值覆盖 .env；而向导字段
+# wizard_sources 是 required + initValue="musicdl"。于是「应用中心重装 FPK」若走安装钩子
+# （同版本重复安装/覆盖安装都走这里），用户在管理页设好的洛雪自定义源会被静默改写回
+# musicdl 聚合音源。表现为：在线搜索/网易歌单还能放，但推荐歌单的曲目 id 是 lx: 形态，
+# _source_enabled() 判定为未启用 → 取流 404 → App 一播就跳下一首。
+# 向导字段本身叫「初始音源」，说明文案也写明「音源安装后可随时在管理页切换」，所以重装
+# 不该覆盖用户的选择。想换音源：在管理页切换；或先卸载再安装（卸载会清掉快照，向导值生效）。
 SOURCES="${wizard_sources:-}"
 case "${SOURCES}" in
     musicdl|musicbox|lxmusic) ;;
-    *) SOURCES="musicdl" ;;
+    *) SOURCES="" ;;
 esac
+INSTALLED_SOURCES="$(fnmusic_snapshot_source)"
+INHERITED=0
+if [ -n "${INSTALLED_SOURCES}" ]; then
+    INHERITED=1
+    if [ -n "${SOURCES}" ] && [ "${SOURCES}" != "${INSTALLED_SOURCES}" ]; then
+        {
+            echo "[fnmusic-ext] 向导选择 ${SOURCES}，本机已安装音源为 ${INSTALLED_SOURCES}："
+            echo "沿用已安装音源（如需切换请在管理页操作，或先卸载再安装）"
+        } >> "${FNMUSIC_DURABLE_LOG}" 2>/dev/null || true
+        echo "[fnmusic-ext] 沿用已安装音源 ${INSTALLED_SOURCES}（忽略向导的 ${SOURCES}）" \
+            >> "${FNMUSIC_LOG}" 2>&1 || true
+    fi
+    SOURCES="${INSTALLED_SOURCES}"
+elif [ -z "${SOURCES}" ]; then
+    SOURCES="musicdl"
+fi
 
 EXTEND="${wizard_extend:-true}"
 case "${EXTEND}" in
@@ -54,6 +80,14 @@ ARGS=(--non-interactive --sources "${SOURCES}" --webui --adopt)
 if [ -n "${wizard_lx_url:-}" ]; then
     # 兼容旧版向导写入的向导值（升级场景等）：有值就透传，无值不要求
     ARGS+=(--lx-source-url "${wizard_lx_url}")
+fi
+# 沿用已安装的洛雪源时与 upgrade_callback 对齐：带上已保存的源地址，并跳过可用性校验
+# ——源是用户装机时已确认过的，重装不该因源服务器临时故障而中止安装（非交互模式下
+# 校验失败会直接中止）。可用性照旧可在管理页查看/重配。
+if [ "${INHERITED}" -eq 1 ] && [ "${SOURCES}" = "lxmusic" ]; then
+    INHERITED_LX_URL="$(fnmusic_saved_lx_url)"
+    [ -n "${INHERITED_LX_URL}" ] && ARGS+=(--lx-source-url "${INHERITED_LX_URL}")
+    ARGS+=(--lx-skip-verify)
 fi
 [ "${EXTEND}" -eq 1 ] && ARGS+=(--extend)
 

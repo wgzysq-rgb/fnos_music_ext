@@ -253,6 +253,30 @@ test("自动下载歌词开关：loadConfig 回填 + collectConfig 收集", asyn
   assert.strictEqual(els.get("#lyric-auto-dl").checked, false);
 });
 
+test("平台推荐歌单开关：loadConfig 回填 + collectConfig 收集", async () => {
+  reset();
+  enqueue("/app/fnmusic-ext/api/config", { values: {
+    FNMUSIC_RECOMMEND_PLAYLIST: "true",
+    FNMUSIC_RECOMMEND_PLAYLIST_SOURCE: "wy,kg",
+    FNMUSIC_RECOMMEND_PLAYLIST_PAGE_SIZE: "8",
+  } });
+  await global.loadConfig();
+  assert.strictEqual(els.get("#recommend-playlist").checked, true);
+  assert.strictEqual(els.get("#recommend-playlist-source").value, "wy,kg");
+  assert.strictEqual(els.get("#recommend-playlist-size").value, "8");
+  const collected = global.collectConfig();
+  assert.strictEqual(collected.FNMUSIC_RECOMMEND_PLAYLIST, true);
+  assert.strictEqual(collected.FNMUSIC_RECOMMEND_PLAYLIST_SOURCE, "wy,kg");
+  assert.strictEqual(collected.FNMUSIC_RECOMMEND_PLAYLIST_PAGE_SIZE, 8);
+  // 缺省（默认关 / 全平台 / 12）表现
+  reset();
+  enqueue("/app/fnmusic-ext/api/config", { values: {} });
+  await global.loadConfig();
+  assert.strictEqual(els.get("#recommend-playlist").checked, false);
+  assert.strictEqual(els.get("#recommend-playlist-source").value, "");
+  assert.strictEqual(els.get("#recommend-playlist-size").value, "12");
+});
+
 /* ------------------------------------------------ 运行 --------------------- */
 (async () => {
   let failed = 0;

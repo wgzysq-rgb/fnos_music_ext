@@ -4,7 +4,10 @@ ARG BASE_IMAGE=python:3.13-slim
 FROM ${BASE_IMAGE}
 
 ARG PIP_INDEX_URL=https://mirrors.tencent.com/pypi/simple/
-ARG APT_MIRROR="https://mirrors.tencent.com"
+ARG APT_MIRROR=https://mirrors.tencent.com
+# 备用源链：留空即用下列内置默认（构建层 shell 兜底；不要在 compose 里以空值透传）
+ARG PIP_FALLBACK_INDEXES=
+ARG APT_FALLBACK_MIRRORS=
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
@@ -23,7 +26,8 @@ WORKDIR /srv
 # 构建容器无法复用"指向本机"的宿主 DNS（Docker 会剔除 127.x 并回退 8.8.8.8，国内不可达），
 # 因此不探测、始终把国内可达的公共 DNS 写到最前（写入失败不中断）；apt-get update
 # 对 DNS 失败只报 W: 警告且退出码为 0，回退判定看「索引是否真正落地」而非退出码；
-# 镜像源与官方源都取不到索引才判失败。安装完成后恢复官方源，宿主机与最终镜像不受影响。
+# 多级源链（APT_MIRROR → APT_FALLBACK_MIRRORS → 官方 deb.debian.org）都取不到索引才判失败。
+# 安装完成后恢复官方源，宿主机与最终镜像不受影响。
 # 失败文案用 "ERROR:" 不用 "[ERROR]"：后者会被应用中心弹窗 grep 成整段 RUN 标题。
 RUN set -eu; \
     fix_dns() { \
@@ -34,21 +38,33 @@ RUN set -eu; \
         cat /tmp/resolv.fnmusic > /etc/resolv.conf 2>/dev/null || true; \
     }; \
     swap_apt_host() { \
-        for f in /etc/apt/sources.list /etc/apt/sources.list.d/debian.sources; do \
-            [ -f "${f}" ] && sed -i -E "s#${1}#${2}#g" "${f}" || true; \
+        _m="${1%/}"; \
+        for f in /etc/apt/sources.list.d/debian.sources; do \
+            [ -f "${f}" ] && sed -i -E "s#^(URIs:[[:space:]]*).*#\1${_m}/debian#" "${f}" || true; \
         done; \
+        if [ -f /etc/apt/sources.list ]; then \
+            sed -i -E "s#^deb[[:space:]]+https?://[^[:space:]]+[[:space:]]+#deb ${_m}/debian #" /etc/apt/sources.list || true; \
+        fi; \
     }; \
     apt_update() { apt-get update -o Acquire::Retries=1 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 || true; }; \
     lists_fetched() { [ -n "$(find /var/lib/apt/lists -name '*Packages*' -print -quit 2>/dev/null || true)" ]; }; \
-    fix_dns; \
-    if [ -n "${APT_MIRROR}" ]; then swap_apt_host 'https?://deb\.debian\.org' "${APT_MIRROR}"; fi; \
-    rm -rf /var/lib/apt/lists/*; \
-    apt_update; \
-    if ! lists_fetched; then \
-        echo "[WARN] apt 镜像源未取到任何索引，回退官方源 deb.debian.org 重试..." >&2; \
+    fetched=0; \
+    _mir_chain="${APT_MIRROR:-https://mirrors.tencent.com} ${APT_FALLBACK_MIRRORS:-https://mirrors.aliyun.com https://mirrors.tuna.tsinghua.edu.cn}"; \
+    for _mir in ${_mir_chain}; do \
+        [ -n "${_mir}" ] || continue; \
+        echo "[INFO] apt 源尝试: ${_mir}"; \
         fix_dns; \
         rm -rf /var/lib/apt/lists/*; \
-        if [ -n "${APT_MIRROR}" ]; then swap_apt_host "${APT_MIRROR}" 'http://deb.debian.org'; fi; \
+        swap_apt_host "${_mir}"; \
+        apt_update; \
+        if lists_fetched; then fetched=1; break; fi; \
+        echo "[WARN] apt 源 ${_mir} 未取到索引，切换下一源..." >&2; \
+    done; \
+    if [ "${fetched}" -ne 1 ]; then \
+        echo "[WARN] 国内 apt 镜像均未取到索引，回退官方源 deb.debian.org 重试..." >&2; \
+        fix_dns; \
+        rm -rf /var/lib/apt/lists/*; \
+        swap_apt_host 'http://deb.debian.org'; \
         apt_update; \
     fi; \
     if ! lists_fetched; then \
@@ -58,12 +74,13 @@ RUN set -eu; \
         exit 1; \
     fi; \
     apt-get install -y --no-install-recommends nodejs ffmpeg supervisor ca-certificates unzip curl; \
-    if [ -n "${APT_MIRROR}" ]; then swap_apt_host "${APT_MIRROR}" 'http://deb.debian.org'; fi; \
+    swap_apt_host 'http://deb.debian.org'; \
     rm -rf /var/lib/apt/lists/*
 
 # 四个服务的 Python 依赖并集（各自 requirements 独立演进，镜像统一安装）
 # 构建容器 DNS 失败自愈同 apt 步骤（resolv.conf 改写不跨 RUN 层持久，需每步自带）；
-# 镜像源安装失败自动回退官方 PyPI 重试
+# pip 源多级回退：主源(PIP_INDEX_URL) → PIP_FALLBACK_INDEXES 依次重试 → 官方 PyPI 沉底。
+# 单次超时/重试显式收紧，避免弱网下每源耗满默认 15s×5retry 把安装卡死。
 COPY musicdl-service/requirements.txt /srv/req.musicdl
 COPY musicbox-service/requirements.txt /srv/req.musicbox
 COPY lxmusic-service/requirements.txt /srv/req.lxmusic
@@ -77,17 +94,31 @@ RUN set -eu; \
         cat /tmp/resolv.fnmusic > /etc/resolv.conf 2>/dev/null || true; \
     }; \
     fix_dns; \
-    pip install --no-cache-dir -r /srv/req.musicdl -r /srv/req.musicbox -r /srv/req.lxmusic -r /srv/req.webui \
-    || { echo "[WARN] pip 镜像源（${PIP_INDEX_URL}）安装失败，回退官方 PyPI 重试..." >&2; \
-         pip install --no-cache-dir -i https://pypi.org/simple \
-            -r /srv/req.musicdl -r /srv/req.musicbox -r /srv/req.lxmusic -r /srv/req.webui; } \
-    && rm -f /srv/req.*
+    REQS="-r /srv/req.musicdl -r /srv/req.musicbox -r /srv/req.lxmusic -r /srv/req.webui"; \
+    PIP_OPTS="--no-cache-dir --timeout 30 --retries 2"; \
+    _idx_chain="${PIP_INDEX_URL:-https://mirrors.tencent.com/pypi/simple/} ${PIP_FALLBACK_INDEXES:-https://mirrors.aliyun.com/pypi/simple/ https://pypi.tuna.tsinghua.edu.cn/simple/ https://mirrors.cloud.tencent.com/pypi/simple/ https://pypi.org/simple}"; \
+    ok=0; \
+    for _idx in ${_idx_chain}; do \
+        [ -n "${_idx}" ] || continue; \
+        echo "[INFO] pip 安装尝试源: ${_idx}"; \
+        if pip install ${PIP_OPTS} -i "${_idx}" ${REQS}; then ok=1; break; fi; \
+        echo "[WARN] pip 源 ${_idx} 安装失败，切换下一源..." >&2; \
+    done; \
+    if [ "${ok}" -ne 1 ]; then \
+        echo "ERROR: 所有 pip 源均安装失败（含官方 PyPI）。国内网络受限时请配置 Docker 代理后重试。" >&2; \
+        echo "ERROR: 可在 Docker daemon.json 配置 proxies 段并重启 Docker，或设置 FNMUSIC_PIP_INDEX 指定可达源。" >&2; \
+        exit 1; \
+    fi; \
+    rm -f /srv/req.*
 
 RUN useradd -m -u 1000 appuser \
     && mkdir -p /data/cache /data/config /data/lxmusic /data/lxserver \
     && chown -R appuser:appuser /data
 
 # lxserver 预编译包引入：构建上下文优先（预置离线 zip）+ 多镜像加速回退链
+# 注意：下载链用「空串元素代表官方源」表达，不用 \"\" 之类转义引号——
+# 那些写法在 compose 变量展开 / BuildKit 引号处理下会被破坏（曾导致 URL
+# 被截断成 .../download/v2.1.2 触发 curl Malformed input）。
 ARG LXSERVER_MIRROR="https://ghfast.top"
 COPY container/lxserver.version /srv/lxserver.version
 COPY container/lxserver-artifact/ /srv/lxserver-artifact/
@@ -96,27 +127,31 @@ RUN set -eu; \
     TARGET_ZIP="/srv/lxserver-artifact/${LXSERVER_ZIP_NAME}"; \
     if [ ! -s "${TARGET_ZIP}" ]; then \
         echo "[INFO] 预置包不存在或为空，通过镜像下载 ${LXSERVER_ZIP_NAME}..."; \
+        REL="https://github.com/XCQ0607/lxserver/releases/download/${LXSERVER_TAG}/${LXSERVER_ZIP_NAME}"; \
+        _mirrors="${LXSERVER_MIRRORS:-${LXSERVER_MIRROR:-https://ghfast.top} https://gh-proxy.com https://github.moeyy.xyz}"; \
         DOWNLOAD_OK=0; \
-        if [ -z "${APT_MIRROR:-}" ]; then \
-            _chain="\"\" ${LXSERVER_MIRROR} https://gh-proxy.com"; \
-        else \
-            _chain="${LXSERVER_MIRROR} https://gh-proxy.com https://github.moeyy.xyz \"\""; \
-        fi; \
-        for mirror in ${_chain}; do \
-            if [ "${mirror}" = "\"\"" ] || [ -z "${mirror}" ]; then \
-                URL="https://github.com/XCQ0607/lxserver/releases/download/${LXSERVER_TAG}/${LXSERVER_ZIP_NAME}"; \
-            else \
-                URL="${mirror}/https://github.com/XCQ0607/lxserver/releases/download/${LXSERVER_TAG}/${LXSERVER_ZIP_NAME}"; \
+        try_url() { \
+            echo "[INFO] 尝试从 $1 下载..."; \
+            if curl -fSL --connect-timeout 10 --max-time 180 "$1" -o "${TARGET_ZIP}" && [ -s "${TARGET_ZIP}" ]; then \
+                DOWNLOAD_OK=1; return 0; \
             fi; \
-            echo "[INFO] 尝试从 ${URL} 下载..."; \
-            if curl -fSL --connect-timeout 10 --max-time 180 "${URL}" -o "${TARGET_ZIP}"; then \
-                if [ -s "${TARGET_ZIP}" ]; then DOWNLOAD_OK=1; break; fi; \
-            fi; \
+            return 1; \
+        }; \
+        for mirror in ${_mirrors}; do \
+            [ -n "${mirror}" ] || continue; \
+            try_url "${mirror}/${REL}" && break; \
         done; \
         if [ "${DOWNLOAD_OK}" -ne 1 ]; then \
-            echo "ERROR: lxserver release zip 下载失败，请预先放置于 container/lxserver-artifact/" >&2; \
+            echo "[INFO] 镜像加速均不可用，直连 GitHub 重试..."; \
+            try_url "${REL}" || true; \
+        fi; \
+        if [ "${DOWNLOAD_OK}" -ne 1 ]; then \
+            echo "ERROR: lxserver release zip 下载失败。离线安装请将 ${LXSERVER_ZIP_NAME}" >&2; \
+            echo "ERROR: 预先放置于 container/lxserver-artifact/ 后再打包。" >&2; \
             exit 1; \
         fi; \
+    else \
+        echo "[INFO] 使用预置离线包 ${LXSERVER_ZIP_NAME}（无需联网）"; \
     fi; \
     ACTUAL_SHA="$(sha256sum "${TARGET_ZIP}" | awk '{print $1}')"; \
     if [ -n "${LXSERVER_SHA256:-}" ] && [ "${ACTUAL_SHA}" != "${LXSERVER_SHA256}" ]; then \

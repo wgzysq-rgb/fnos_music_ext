@@ -21,6 +21,10 @@ services:
         BASE_IMAGE: ${FNMUSIC_BASE_IMAGE:-python:3.13-slim}
         PIP_INDEX_URL: ${FNMUSIC_PIP_INDEX:-https://mirrors.tencent.com/pypi/simple/}
         APT_MIRROR: ${FNMUSIC_APT_MIRROR:-https://mirrors.tencent.com}
+        # 备用源链不在此处透传：compose 用 ${VAR:-} 展开空值会以空串覆盖 Dockerfile
+        # 内的 ARG 默认值，且会把 ARG 里的引号破坏掉（曾导致构建失败）。
+        # 需要在 .env 自定义时，见 .env.example 的 FNMUSIC_PIP_FALLBACK_INDEXES 说明
+        # （由 install.sh 在构建前写入，或直接改本文件并显式提供非空值）。
     image: fnmusic-sources:latest
     container_name: fnmusic-sources
     ports:

@@ -102,13 +102,74 @@ def _remove_dir(directory: str) -> None:
 
 
 def _usable_cache(directory: str) -> dict | None:
-    """磁盘上已完整（done + init 存在）的转码缓存，返回 state。"""
+    """磁盘上已完整（done + init 存在）的转码缓存，返回**已自愈**的 state。
+
+    自愈必须挂在这个统一出口上，不能散在各调用点：`peek_cached()` 会被
+    `_transcode_live()` 直接用来生成 playlist —— App 重启后第一次拉
+    /preset.m3u8 走的就是这条路径，它**完全绕过** `ensure_session()`。
+    只在 ensure_session 里修的话，历史坏会话仍会带着错误的声明分片数输出
+    playlist，那正是「歌名/歌手正常、一播就跳下一首」的成因。
+    （机制详见 `_heal_declared_count`。）
+    """
     state = _read_state(directory)
     if state.get("status") != "done":
         return None
     if not os.path.isfile(os.path.join(directory, INIT_NAME)):
         return None
-    return state
+    return _heal_declared_count(directory, state)
+
+
+def _count_segments(directory: str) -> int:
+    """已产出的分片数（temp_file 改名后出现即完整，见模块开头说明）。"""
+    try:
+        return sum(1 for name in os.listdir(directory) if _SEGMENT_RE.match(name))
+    except OSError:
+        return 0
+
+
+def _heal_declared_count(directory: str, state: dict) -> dict:
+    """把磁盘 state 里的声明分片数**同步到实际已产出的分片数**。
+
+    声明分片数由 `floor(duration_s / hls_time)` 预合成，其正确性依赖
+    「声明数 ≤ ffmpeg 实际产出数」（见模块开头：「App 多要一片会 404」）。
+    但这条不变量只在 duration_s 来自**真实时长**时才成立：一旦上游用估算时长
+    （如歌单接口标注的时长）传入，两个方向都会坏：
+
+      * 声明数 > 实际数 → App 拉到不存在的分片 → 404 → 整首跳下一首；
+      * 声明数 < 实际数 → playlist 提前 ENDLIST → 后半段音频被丢掉、
+        进度条走不满就跳下一首。
+
+    取 floor 只是「会话还在跑、拿不到最终分片数」时的保守做法；而本函数只在
+    `status == "done"`（ffmpeg 已正常退出、分片全部落盘）的缓存上调用，
+    此时实际分片数就是完整答案，直接同步即可，且**无需重新转码**：
+      * 磁盘 state 是持久化的，光修上游调用点救不回已落盘的坏会话，
+        必须在这里按真实分片数校正。
+
+    纯函数、不回写磁盘：`declared_count` 由真实分片数推导，每次读出口重算即可，
+    回写反而会把 state.json 的 mtime 搅乱（mtime 是配额 LRU 的访问时间）。
+    """
+    try:
+        declared = int(state.get("declared_count") or 1)
+    except (TypeError, ValueError):
+        declared = 1
+    actual = _count_segments(directory)
+    if actual <= 0 or declared == actual:
+        return state
+    healed = dict(state)
+    healed["declared_count"] = actual
+    try:
+        hls_time = float(healed.get("hls_time") or 0) or 0.0
+    except (TypeError, ValueError):
+        hls_time = 0.0
+    if hls_time > 0:
+        # 时长与分片数保持一致，最后一个 EXTINF 才不会虚高
+        healed["duration_s"] = hls_time * actual
+    logger.info(
+        "transcode state 自愈 %s: declared=%s actual=%d (duration_s %.1f→%.1f)",
+        state.get("guid"), state.get("declared_count"), actual,
+        float(state.get("duration_s") or 0), float(healed.get("duration_s") or 0),
+    )
+    return healed
 
 
 def _declared_count(duration_s: float, hls_time: float) -> int:
@@ -216,7 +277,7 @@ async def ensure_session(
         alive.last_beat = time.monotonic()
         return alive
 
-    state = _usable_cache(directory)
+    state = _usable_cache(directory)   # 出口已按磁盘真实分片数自愈
     if state:
         sess = Session(
             guid=guid, directory=directory,
@@ -285,7 +346,10 @@ def get_session(guid: str) -> Session | None:
 
 
 def peek_cached(guid: str, root: str) -> Session | None:
-    """磁盘上已完整的转码缓存直取（不解析源、不启进程），供重播秒开。"""
+    """磁盘上已完整的转码缓存直取（不解析源、不启进程），供重播秒开。
+
+    state 经 `_usable_cache()` 出口自愈，声明分片数与磁盘实际产出一致。
+    """
     directory = session_dir(root, guid)
     state = _usable_cache(directory)
     if not state:

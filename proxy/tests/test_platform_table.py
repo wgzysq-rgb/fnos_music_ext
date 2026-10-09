@@ -2,7 +2,10 @@
 以及交互菜单精选平台与 ★ 行的一致性。"""
 import re
 import subprocess
+import sys
 from pathlib import Path
+
+import pytest
 
 BASE = Path(__file__).resolve().parents[2]
 
@@ -88,6 +91,10 @@ def test_table_invariants():
     assert 53 not in mdl_ids, '编号 53 已随上游下线退役，不得复用'
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="用 bash -c 实际执行 install.sh 菜单函数（CI/Linux 覆盖）",
+)
 def test_menu_curated_matches_md_star_rows():
     """向导列出的编号必须与表中 ★ 行的全局 ID 一致（不再重映射）。"""
     starred = [(n, p, s) for n, p, s, _f, _l, star in _install_table() if star]

@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
-"""修复曲库里以 unknown 命名落盘的边听边存文件（issue #28 存量数据修复）。
+"""修复曲库里以 unknown / 未知占位名落盘的边听边存文件（issue #28 与 2.7.5 存量数据修复）。
 
-背景：2.5.0 之前，客户端在音频下载结束瞬间快速断开等场景会让流式上下文的
-元数据解析失败，文件以 "unknown (n).<ext>" 命名进曲库，飞牛扫描后音乐库显示
-Unknown 且无元数据。2.5.0 已从根上修复（断流护航 + 元数据兜底回查），本脚本
-用于修复修复点上线之前已经落盘的存量文件。
+背景一（2.5.0 之前，issue #28）：客户端在音频下载结束瞬间快速断开等场景会让流式
+上下文的元数据解析失败，文件以 "unknown (n).<ext>" 命名进曲库。
+背景二（≤2.7.4）：元数据落盘链路只判"字段非空"，把上游（lxserver）合成的占位常量
+`未知曲目` / `未知歌手` 当成有效值，文件以 "未知歌手 - 未知曲目.<ext>" 命名进曲库，
+写进文件的标签也是这两个占位值——表现为播放界面歌名正常，但下载/边听边存到本地
+后显示「未知歌手 - 未知曲目」。2.7.5 起落盘与下载链路都过在线登记表回填（新落盘
+不会再出现），本脚本负责修复此前已落盘的存量文件。
 
 原理：边听边存落盘时会写 <cache_dir>/<cache_safe_guid>.ref 记录文件的词干；
-播放历史/在线收藏里保存了 guid → 标题/歌手快照。三者一拼即可把 unknown 文件
+在线登记表（推荐歌单/平台推荐歌单下发时登记，recommend_cache/online-track-index.json）
+与播放历史/在线收藏里保存了 guid → 标题/歌手/专辑。三者一拼即可把占位式文件
 重新定名并写回 ID3/Vorbis 标签。
 
 用法（默认只预览，不改动任何文件）：
@@ -15,21 +19,29 @@ Unknown 且无元数据。2.5.0 已从根上修复（断流护航 + 元数据兜
     python3 scripts/repair_unknown_library.py --apply    # 实际重命名 + 写标签
     python3 scripts/repair_unknown_library.py --base /vol1/@appcenter/fnmusic-ext/repo
 
-只处理文件名恰为 unknown / unknown (n) 的词干；改名永不覆盖已有文件（自动编号）；
-.ref 与同名 .lrc 一并随迁。写标签失败只告警，不影响重命名。
+只处理文件名是占位式的词干（unknown / unknown (n) / 含"未知…"占位片段）；改名永不
+覆盖已有文件（自动编号）；.ref 与同名 .lrc 一并随迁。写标签失败只告警，不影响重命名。
 """
 from __future__ import annotations
 
 import argparse
 import os
-import re
 import sys
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 
-UNKNOWN_RE = re.compile(r"unknown( \(\d+\))?$", re.IGNORECASE)
+
+def is_placeholder_stem(stem: str) -> bool:
+    """词干是否为上游占位式：unknown / "未知歌手 - 未知曲目" / "未知曲目"。
+
+    判定规则收拢在登记表模块（`online_registry.is_placeholder_name`），
+    app 下载自愈与本脚本共用同一条，避免两处各写一份"什么算未知"。
+    """
+    from proxy import online_registry as onreg
+
+    return onreg.is_placeholder_name(os.path.basename(stem or ""))
 
 
 def _load_env_file(base: str) -> None:
@@ -50,9 +62,28 @@ def _load_env_file(base: str) -> None:
 
 
 def load_guid_snapshots(app) -> dict[str, dict]:
-    """guid → {title, artist, album}（播放历史 + 在线收藏，形状同 _lookup_online_snapshot）。"""
-    out: dict[str, dict] = {}
+    """guid → {title, artist, album}。
+
+    来源优先级：在线登记表（歌单下发时的真实元数据，最可靠）→ 播放历史/在线收藏。
+    """
     import json
+
+    from proxy import online_registry as onreg
+
+    out: dict[str, dict] = {}
+    try:
+        for guid, meta in onreg.REGISTRY.snapshot().items():
+            title = str(meta.get("title") or "").strip()
+            artist = str(meta.get("artist") or "").strip()
+            if not (app._is_real_tag(title) and app._is_real_tag(artist)):
+                continue
+            out[guid] = {
+                "title": title,
+                "artist": artist,
+                "album": str(meta.get("album") or "").strip(),
+            }
+    except Exception:  # noqa: BLE001
+        pass
 
     dirs = []
     try:
@@ -135,7 +166,7 @@ def main() -> int:
         return 0
 
     plan: list[tuple[str, str, str, str, dict]] = []  # (audio, lrc, new_stem, ref, meta)
-    seen_unknown = 0
+    seen_placeholder = 0
     for guid, meta in snapshots.items():
         ref = app.media_ref_path(guid)
         if not os.path.exists(ref):
@@ -145,9 +176,9 @@ def main() -> int:
                 stem = app._path_stem(f.read().strip())
         except Exception:
             continue
-        if not stem or not UNKNOWN_RE.match(os.path.basename(stem)):
+        if not stem or not is_placeholder_stem(stem):
             continue
-        seen_unknown += 1
+        seen_placeholder += 1
         audio = next(
             (f"{stem}.{ext}" for ext in app.CACHE_EXTS
              if os.path.exists(f"{stem}.{ext}") and os.path.getsize(f"{stem}.{ext}") > 0),
@@ -162,7 +193,7 @@ def main() -> int:
         plan.append((audio, lrc, new_stem, ref, meta))
 
     if not plan:
-        print(f"[OK] 扫描 {len(snapshots)} 个 guid / {seen_unknown} 个 unknown 词干：没有可修复项"
+        print(f"[OK] 扫描 {len(snapshots)} 个 guid / {seen_placeholder} 个占位式词干：没有可修复项"
               "（文件可能已被删除或已修复）")
         return 0
 

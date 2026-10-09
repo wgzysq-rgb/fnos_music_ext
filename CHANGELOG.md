@@ -5,6 +5,362 @@
 
 ## [Unreleased]
 
+## [2.7.7] - 2026-10-10
+
+### 新增
+
+- **封面代理 + NAS 落盘缓存**（修复「手机 App 封面正常、电脑浏览器封面经常加载不出来」）：
+  根因不在扩展缓存，而在浏览器行为 —— Chrome 86+ 会对 http 图片做 mixed-content
+  自动升级（https），部分音源 CDN 不支持 https，升级失败后图片被**静默丢弃**；
+  手机 App 不受 mixed-content 约束，所以同一首歌 App 有图、网页没图。
+  - `/static/cover` 全部 7 处外部 302 点（发现页卡片×2、网易账号歌单、专辑锚点、
+    直链、kw rid/qq albummid 直构、网易补全）统一改为：**本地缓存命中 → 直接回
+    NAS 文件；未命中 → 代理代取封面字节并原子落盘；彻底失败 → 回落原 302 直链**
+    （行为与旧版完全一致，绝不因代理故障而 404）；
+  - 缓存目录 `FNMUSIC_COVER_CACHE_DIR`（默认 `<cache>/covers`），按 URL sha256
+    命名 + 魔数嗅探扩展名，数量超 `FNMUSIC_COVER_CACHE_MAX`（默认 2000）按最旧
+    mtime 淘汰；总开关 `FNMUSIC_COVER_PROXY`（默认开），三项均支持 .env 热重载；
+  - WebUI「边听边存」分组新增「封面代理缓存（NAS）」开关；`.env.example` 与
+    README 配置表同步补齐；
+  - 新增 `proxy/tests/test_cover_proxy.py`（11 个回归用例：缓存读写/淘汰、开关
+    关闭直连、取回失败回落 302、二次请求纯缓存命中断网验证、kw 文本假图/非
+    http 拒代理）。
+
+### 修复
+
+- **边听边存「静默降级」无任何提示**（用户反馈"不知道存哪儿了/压根没存"的定位成本来源）：
+  曲库探测（`detect_library_dir`）读不到飞牛 music.db 或 shared_library 无可用
+  路径时，落盘目录静默回退到 cache 目录 —— 文件仍在落（哈希名），但**不进官方
+  曲库**，看起来就像功能失效。现在该回落会打 WARNING（music.db 缺失 / 无可用
+  路径两种情形分别给出 .env 修法：`FNMUSIC_MUSIC_DB` 或 `FNMUSIC_LIBRARY_DIR`），
+  shared_library 里有路径但全部不可访问时同样留痕。
+
+### 变更
+
+- `scripts/diagnose_playback.sh` 新增 **2b 边听边存诊断段**：打印 tee/曲库/封面
+  相关全部环境变量、music.db 存在性与 shared_library 路径、三个落盘候选目录
+  的最近文件、封面缓存目录规模；日志段 grep 增补 tee/finalize/cover/曲库/落盘
+  关键词，并附「边听边存关注这几行」速查（stream probe 的 range 形态与
+  tee_eligible、tee finalize done 的 dest 路径、Background full fetch、曲库
+  探测告警、Library scan 触发）。边听边存疑似失效时，跑一次该脚本把输出贴回
+  即可定位是「开关被关 / 音质走转码 / 曲库探测回落」中的哪一种。
+
+## [2.7.6] - 2026-10-10
+
+### 修复
+
+- **「最近播放」「收藏」列表里仍显示「未知歌曲 / 未知歌手」（2.7.5 元数据修复的漏网）**：
+  2.7.5 只把在线登记表接进了**落盘链路**（曲库定名/文件标签/下载），而**列表接口**读的是
+  另一份数据 —— 本地存储的**历史快照**，渲染时从不查登记表。
+
+  数据流对照（这是"改一处漏一处"的根源）：
+
+  | 出口 | 元数据来源 | 2.7.5 是否已接登记表 |
+  | --- | --- | --- |
+  | 播放详情 `/track/metadata` | 上游 `/info` + 登记表 | ✅ |
+  | 落盘/下载（定名、写标签） | `_info_for_background_save()` 等 | ✅ |
+  | **最近播放 `/play-history/list`** | `play_history/<user>.json` 快照 | ❌ |
+  | **收藏 `/favorite-track/list`** | `online_favorites/<user>.json` 快照 | ❌ |
+  | **官方歌单附加条目** | `playlist_tracks/<user>.json` 快照 | ❌ |
+  | **写入侧** `POST /event/report` | 上报 payload + 搜索会话 + 歌单缓存 | ❌（不查登记表） |
+
+  两个独立缺陷叠加：
+  ① **列表渲染只读旧快照**：`build_favorite_track_obj()` 直接拿快照构造下发 VO，
+  从不回查登记表，也不做占位值判定 —— 旧快照里的「未知曲目/未知歌手」会一直显示下去；
+  ② **上报写入不带元数据**：`event/report` 处理 `track_play` 时以空 `stub_online_info()`
+  为底，只从上报 payload / 搜索会话 / 歌单磁盘缓存补齐，**从不查登记表**；而推荐歌单、
+  平台推荐歌单、网易账号歌单的曲目**从不经过搜索**，搜索会话必然落空 → 历史快照自带
+  占位/空值，随后被列表渲染固化。
+
+  修复（写入与渲染两侧同时收口，避免再漏）：
+  - `build_favorite_track_obj()` 内接入登记表回填 —— 所有"快照 → 下发 VO"的**单一收口点**
+    （收藏列表、最近播放、歌单附加条目、收藏创建、歌单添加共用）；
+  - 新增 `_heal_stored_meta()`：列表渲染期两级自愈，在线登记表 → 推荐/网易账号歌单磁盘缓存
+    （登记表按 14 天 TTL 轮换，过期后仍能从歌单缓存还原真名）；两级都查不到时保持原样，
+    绝不臆造；
+  - 最近播放列表的空值判定从「标题是否为空」改为 `_is_real_tag()`（**占位即缺失**），
+    补齐用 `_merge_missing_tags()` —— 上游占位值不再挡住回查到的真名；
+  - `event/report` 写入前先过登记表，合并一律走 `_merge_missing_tags()`；**落库前剥离占位值**
+    （存空值而非"未知曲目"，交给列表期自愈再次尝试补全，避免脏值把兜底链一次钉死）；
+  - `_best_effort_online_info()`：不再拿**占位式文件名**（≤2.7.4 落库的
+    `未知歌手 - 未知曲目.mp3`）当元数据写进收藏/歌单快照，占位值绝不扩散；
+  - `_lookup_online_snapshot()`：优先返回带真实标题/歌手的快照 —— 播放历史里的占位旧快照
+    不再挡住收藏/歌单里的真名；
+  - 聚合专辑详情（musicdl/lx）候选先过登记表回填再按专辑名归组，专辑页标签页同样受益。
+
+### 开发
+
+- 新增「元数据出口矩阵」回归用例（`proxy/tests/test_transcode_compat.py` +8 例）：
+  收藏列表 / 最近播放列表 / 官方歌单附加条目 / 播放详情 / 上报写入，用**同一份脏数据**
+  （占位值快照 + 上游只返回占位值）打全部出口，逐条断言必须给出登记表里的真名。
+  任何出口（含后续新增的）漏接回填都会直接失败。
+  反向验证：把 `_registry_apply()` 短路成恒等后，`build_favorite_track_obj` 回填、
+  历史上报回填、出口矩阵三例全部失败。
+- **本地测试提速与去噪（Windows 开发机；CI/Linux 不受影响）**：此前本机全量
+  `pytest proxy/tests` 恒定 36 failed（全是平台差异：POSIX shell 片段、AF_UNIX、
+  0600 权限位、fcntl、假 ffmpeg 的 shebang 执行），每轮都要人工比对"36 基线"，
+  且最慢的 `test_install_edges.py`（18 例，约 4 分钟）全部必败。现按类收口：
+  · `conftest.py` 对 POSIX 专属三文件（fcntl/UDS 进程接管）`collect_ignore`；
+  · `test_install_edges` / `test_webui_gateway` 整文件 `skipif(win32)`；
+  · `test_version_env` 两例权限位断言、`test_platform_table` 的 bash 菜单执行用例
+    单独 `skipif(win32)`；
+  · `fake_ffmpeg` fixture 统一做可执行性探测，不能直接 exec .py 的平台整组 skip
+    （原来 8 例恒红，只 1 例手工 skip）。
+  效果：本机全量 5m25s/36 failed → **1m23s/0 failed**（472 passed / 55 skipped），
+  失败清单不再需要 `--tb=line` 补捞。musicbox 的 2 例扫码用例是本机 venv 缺
+  `qrcode`/`pillow`（CI 本来就装），补装即绿。
+
+## [2.7.5] - 2026-10-10
+
+### 修复
+
+- **下载到本地 / 边听边存落库的曲目显示「未知歌手 - 未知曲目」（2.7.3 元数据修复的漏网）**：
+  2.7.3 只把在线登记表接到**播放详情**（`_online_info()`），而**落盘链路**（曲库定名、
+  写文件标签、下载产物打标签）走的是另一条元数据解析路径 —— 既不查登记表，也只判
+  「字段非空」。
+
+  后果：上游（lxserver 未命中缓存时）合成的占位常量 `未知曲目` / `未知歌手` 被当成有效
+  元数据 —— 文件以 `未知歌手 - 未知曲目.<ext>` 落进曲库，写进文件的标签也是这两个占位值，
+  App 下载到本地后就按这个名字与标签显示。播放界面正常（走的是已修好的详情链路），
+  所以症状表现为「播放没事、下载到本地是未知」。
+
+  修复：
+  - 新增 `_registry_apply()`（登记表回填**统一出口**）与 `_has_real_title()` / `_is_real_tag()`：
+    「有标题」的判定排除上游占位值；所有落盘点（`_info_for_background_save`、
+    `_merge_missing_tags()` / `_tee_metadata_fallback()`、下载打标签）一律先过登记表回填；
+  - 元数据回查优先级：在线登记表（歌单下发时的真实值）→ 推荐/网易账号歌单磁盘缓存 →
+    播放历史/收藏/自建歌单；占位值按**缺失**处理，因此回查到的真名能覆盖上去；
+  - 下载链路（`/music/api/v1/download/track/transcode/*`）：
+    · 落盘源先经 `_dl_tagged_media()` 自愈 —— 补写真实标签，文件名仍是占位式时**同步改名**
+      （同名 `.lrc` 随迁、`.ref` 更新、通知官方重扫）。**滚动缓存文件不原地改写**（可能正被
+      播放读取），改为另存一份带标签的副本供下载；解析不出真名时原样供文件，绝不制造半成品；
+    · 标准档转码产物此前被 `-map_metadata -1` 清空标签后**没有补写**（下载到本地完全没有
+      标签），现由 `_dl_tag_transcoded()` 补写真实元数据；
+    · 下载响应的 `Content-Disposition` 改用真实元数据文件名（转码档此前给的是 guid 哈希名，
+      原始档给的是曲库名 —— 可能本身就是占位式），App 存到本地后即为「歌手 - 歌名.ext」。
+  - 存量数据：`scripts/repair_unknown_library.py` 的覆盖面从 `unknown(n)` 扩展到**占位式
+    文件名**，并接入在线登记表作为元数据来源（默认仍是 dry-run 预览，`--apply` 才动手）。
+
+### 开发
+
+- `online_registry` 新增公开出口 `is_placeholder()` / `is_placeholder_name()` / `snapshot()`：
+  占位值判定收拢到一处，app 侧下载自愈与存量修复脚本共用同一规则。
+- `proxy/tests/test_transcode_compat.py` 新增 10 例：登记表回填优先于上游占位值、`_tee_finalize`
+  按真名落盘、下载自愈改名与 `.lrc` 随迁、查不到真名时不改写、滚动缓存出带标签副本、
+  下载端点响应名、转码产物打标签（抽出的 `_dl_tag_transcoded()` 直接单测，不依赖真 ffmpeg）；
+  `proxy/tests/test_online_registry.py` 新增 3 例。
+  反向验证：把 `_registry_apply()` 短路成恒等后，上述 5 个承重用例全部失败。
+
+## [2.7.4] - 2026-10-09
+
+### 修复
+
+- **应用中心重装/升级 FPK 后音源被静默重置回 musicdl 聚合音源（严重，推荐歌单曲目
+  全部「一播就跳下一首」的最终根因）**：两个独立缺陷叠加所致。
+
+  ① **fpk 钩子读 `.env` 对不上真实格式**（`packaging/fpk/cmd/_common`）：
+  install.sh 与 WebUI 写出的值一律经 `env_merge.quote_env_value()` **单引号包裹**
+  （`FNMUSIC_LX_ENABLED='true'`、`LX_SOURCE_URL='http://…'`），而
+  `fnmusic_env_source()` 只认裸 `KEY=true`、`fnmusic_saved_lx_url()` 不剥引号。后果：
+  · `fnmusic_saved_source()` 对真实 `.env` **恒返回空** → `upgrade_callback` 只能回落
+  `musicdl`，用户选好的音源在每次升级后丢失；
+  · `fnmusic_saved_lx_url()` 返回的带引号 URL 传给 install.sh `--lx-source-url` 时不匹配
+  `http(s)://` / `file://` 分支，被当成「本机 .js 文件路径」→ `log_err` **直接中止升级**。
+
+  ② **`install_callback` 从不参考已安装音源**：它只读向导值 `wizard_sources`，取不到就
+  **硬编码回落 `musicdl`**；而向导字段是 `required` + `initValue="musicdl"`，同版本重装 /
+  App Center 覆盖安装（都走安装钩子）时会提交默认值。叠加 install.sh 把
+  `FNMUSIC_MUSICDL_ENABLED` / `FNMUSIC_LX_ENABLED` 当作「安装时部署选项」**永远以本次
+  安装值覆盖 `.env`**，用户设好的洛雪自定义源就被改写回 musicdl 聚合音源。
+
+  现象之所以具有迷惑性：曲目元数据（歌名/歌手/封面）由在线登记表提供，**音源被切走也照
+  常显示**；但推荐歌单的曲目 id 是 `lx:` 形态，`_source_enabled()` 判定为未启用 → 取流
+  直接 404 → App 一播就跳下一首。这也解释了此前几轮「歌名正常、一播就跳」的反复。
+
+  修复：
+  - `fnmusic_env_source()` 统一剥离 `export` 前缀 / 单双引号 / 空白（含 CRLF 的 `\r`）后
+  再比对，兼容 `true` / `1` / `yes`；`fnmusic_saved_lx_url()` 同样剥引号；
+  - `install_callback` 改为**本机已安装时一律沿用已安装音源**：优先 `.env`
+  （管理页切源即写这里，最新），其次 `install_init` 在新包落盘**之前**写入的持久快照
+  （`/var/lib/fnmusic-ext/installed-source` —— 重装会重建 `target/`，`.env` 可能先被清掉）。
+  沿用洛雪源时与 `upgrade_callback` 对齐，带上已保存的源地址并 `--lx-skip-verify`，
+  避免源服务器临时故障让重装直接中止；向导值与实际采纳值都会写进持久安装日志；
+  - `uninstall_callback` 清掉该快照，使「卸载后重新安装」仍回到向导的初始音源选择。
+  向导字段本就叫「初始音源」、说明也写明「安装后可随时在管理页切换」，因此重装不再覆盖
+  用户选择：想换音源请用管理页，或先卸载再安装。
+
+### 开发
+
+- `packaging/tests/test_fpk_cmds.py` 新增 6 例：重装沿用已装音源、`.env` 被清空时用快照
+  兜底、首次安装仍按向导、`install_init` 写快照、`uninstall_callback` 清快照、
+  `.env` 引号与 CRLF 兼容。并把 `test_common_saved_source_priority` /
+  `test_common_saved_lx_url` 的用例改为**真实的单引号格式** —— 此前用例写的是裸
+  `KEY=true`，恰好绕过了这个 bug（测试与实现犯了同一个错）。
+- 新增 `scripts/verify_fpk_source_keep.sh`：不依赖特权软链沙箱校验 fpk 钩子的音源保持
+  行为（21 项断言：`.env` 格式兼容、四种 `install_callback` 组参场景、快照读写与清理）。
+  在 Windows（Git Bash）/ Linux 均可运行；`packaging/tests/test_fpk_cmds.py` 依赖
+  `os.symlink`、`test_fpk_pack.py` 依赖 `build.sh`（需要 rsync），二者在无特权的
+  Windows 上无法运行。
+
+## [2.7.3] - 2026-10-09
+
+### 修复
+
+- **发现页歌单卡名字退化成「QQ音乐推荐歌单」「网易云音乐推荐歌单」**：歌单卡的**真实名字**
+  此前只存在于进程内的 `_DISCOVER_CACHE`（30 分钟 TTL、扩展重启即空、上游弱网/限流时整块
+  为空），而反查用的 `_discover_detail_record()` 里是**硬编码**的 `f"{label}推荐歌单"`。
+  于是只要 App 不是靠 `playlist/list` 里的卡片、而是按 guid 去 `playlist/detail` /
+  `batch-detail` 反查（或扩展重启后再看），名字就只剩平台通用名。修复：
+  ① 新增落盘索引 `recommend_cache/discover-cards.json`（`_DISCOVER_CARD_INDEX`），卡片抓到
+  时记下真名 / 封面 / 作者 / 曲目数 / 播放量 / 简介（原子写、损坏静默降级、超 2000 条淘汰最旧）；
+  ② `_discover_detail_record()` 优先用抓到的真名，**只有该歌单卡从未成功抓到过**时才退回平台通用名；
+  ③ `_fetch_discover_cards()` 在上游不可用时回落落盘索引，避免歌单列表整块消失（只剩通用名条目）。
+- **转码声明分片数自愈漏掉「重启后播放」这条路径（2.7.2 修复的漏网，导致仍旧整首跳下一首）**：
+  自愈原先只挂在 `ensure_session()` 的复用分支上，但 App 重启后拉
+  `/music/api/v1/track/hls/{guid}/preset.m3u8` 走的是
+  `_transcode_live()` → `peek_cached()`，**完全绕过** `ensure_session()`。磁盘上 2.7.1 期间
+  用估算时长落下的坏 `state.json` 因此照样输出比实际多的声明分片数 → App 拉不存在的分片
+  404 → 整首跳下一首。修复：把自愈移到所有读路径的统一出口 `_usable_cache()`
+  （`ensure_session()` / `peek_cached()` 都经过它），并保持自愈是纯函数、不回写磁盘
+  （`state.json` 的 mtime 是配额 LRU 的访问时间，回写会把 LRU 顺序搅乱）。
+
+### 新增
+
+- **取流失败留痕**：`track/stream` 的在线取流此前失败是**完全静默**的 —— App 拿到 404 就跳
+  下一首，而服务端一行日志都没有，导致「能显示曲目和歌名、一播就跳」在日志里不可见。
+  现在两处都会告警：`resolve_lx_url()` 整条音质链失败（带音质链与最后状态，提示检查洛雪源
+  是否已激活），以及 `stream_track()` 候选全部不可用时。
+- **只读诊断脚本 `scripts/diagnose_playback.sh`**：`sudo bash scripts/diagnose_playback.sh`
+  一把收集 播放问题所需的全部现场（容器状态、关键环境变量、洛雪 `/api/v1/source` 源激活
+  状态、直链三档音质解析实测、取流相关日志筛选、转码 HLS 会话「声明数 vs 磁盘实际数」一致性、
+  ffmpeg 负载、磁盘空间），输出到 `/tmp/fnmusic-playback-diag-<时间戳>.txt`，不改动任何状态。
+
+### 开发
+
+- `proxy/tests/test_transcode_compat.py` 新增 3 例：`_usable_cache()` 出口即自愈（且不回写磁盘）、
+  `peek_cached()` 同样拿到自愈后的声明数、以及**端到端**用例「磁盘上留着坏会话时，重启后
+  第一次拉 playlist 的声明分片数必须等于磁盘实际分片数」。经反向验证：关掉自愈即还原为多声明。
+- `proxy/tests/test_discover_playlists.py` 新增 5 例：详情/批量详情端点回真实歌单名、重启
+  （清空全部内存态）后仍回真名、上游返回空时回落落盘卡片、从未抓到过卡片时才用通用名。
+
+## [2.7.2] - 2026-10-09
+
+### 修复
+
+- **推荐歌单曲目播放中断、整首跳下一首（2.7.1 引入的回归，严重）**：2.7.1 的在线曲目
+  元数据登记表把**歌单标注时长**一并回填进了 `duration_s`，而这个值会流入「标准音质」
+  的服务端转码链路：`transcode` 用 `floor(duration_s / hls_time)` 预合成完整的 VOD
+  playlist（App 只拉一次 playlist，必须一次给全），其正确性依赖
+  「声明分片数 ≤ ffmpeg 实际产出数」这一不变量 —— 见 `transcode.py` 开头
+  「App 多要一片会 404」。该不变量只在 `duration_s` 来自**真实时长**时成立：
+  上游拿不到时长时它是 `0`，`transcode.ensure_session()` 会用 `probe_duration()`
+  ffprobe 实测；而歌单标注的是「上游平台官方版」时长，与实际播放的**洛雪音源直链**
+  可能不一致，于是两个方向都会坏：
+  · **声明数 > 实际数** → App 拉到不存在的分片 → 404 → 整首跳下一首；
+  · **声明数 < 实际数** → playlist 提前 `#EXT-X-ENDLIST` → 后半段音频被丢掉、
+    进度条走不满就跳下一首。
+  修复两层：
+  ① 登记表**只回填展示字段**（title / artist / album / cover_url），`duration_s`
+  一律不动，让转码重新走实测时长 —— 即恢复到 2.7.0 的播放行为（`apply()` 内已写明
+  理由，并加了专门的回归用例）；
+  ② 新增 `transcode._heal_declared_count()`：复用磁盘上**已完成**的转码会话前，
+  把声明分片数同步为磁盘上真实的分片数（双向，并同步 `duration_s`）。这一层是必需的
+  —— 磁盘 state 是持久化的，只修上游调用点救不回 2.7.1 期间已经落盘的坏会话；
+  顺带也消除了原先取 `floor` 带来的末尾截断（实测每首会少 0～10 秒尾巴）。自愈只在
+  播放路径 `ensure_session()` 触发，配额扫描不受影响。
+
+### 开发
+
+- **转码声明分片数自愈测试**：`proxy/tests/test_transcode_compat.py` 新增 5 例，覆盖
+  双向同步、声明与实际一致时不改动、磁盘无分片时不误改、`_count_segments()` 只认
+  `^\d{5}\.m4s$`（忽略 `.tmp` 等），以及 `ensure_session()` 复用时会话的声明数已自愈。
+
+## [2.7.1] - 2026-10-09
+
+### 新增
+
+- **平台推荐歌单（发现·歌单广场）**：把各平台的推荐歌单注入到飞牛音乐 App 的歌单列表，
+  能力与柠檬音乐「发现」页同源（QQ 歌单广场 `/musicu.fcg get_playlist_by_tag`、网易
+  `playlist/list`、酷我 `getRcmPlayList`、酷狗 `getSpecial`、咪咕歌单广场
+  `playlist-square-recommend`）。每个平台按 `FNMUSIC_RECOMMEND_PLAYLIST_PAGE_SIZE`
+  注入若干张虚拟歌单卡（`online:playlist:discover:<src>:<plid>`），点进去拉该平台歌单曲目，
+  曲目按洛雪 `lx:<platform>:<id>` 契约下发，播放/歌词/收藏全部复用既有在线链路。
+  属公共内容（不读个人历史与收藏），shared 会话同样可见；平台接口不可用时该平台静默跳过，
+  不影响其他平台与官方歌单。开关 `FNMUSIC_RECOMMEND_PLAYLIST`（默认关）、
+  白名单 `FNMUSIC_RECOMMEND_PLAYLIST_SOURCE`（空=全部）均支持热重载，WebUI「播放与推荐」
+  页可配置。
+
+### 修复
+
+- **文件行尾（CRLF）污染安装脚本与构建参数，导致安装失败（严重，连续三轮失败的主因）**：
+  仓库在 Windows 上以 `core.autocrlf=true` 检出后工作区文本文件全部变成 CRLF。
+  第一层症状是安装脚本直接起不来 —— shebang 变成 `#!/usr/bin/env bash\r`，
+  执行 `install.sh` 报 `line 2: set: pipefail: invalid option name`。
+  修掉脚本自身后仍持续失败，真正根因是**无扩展名文件
+  `container/lxserver-artifact/lxserver.version` 被「扩展名白名单」漏判**、未做 LF
+  规范化：其尾部 `\r` 被 `. <file>` source 进 `LXSERVER_ZIP_NAME`，拼进下载 URL 后
+  curl 直接报 `curl: (3) URL rejected: Malformed input`；终端回车符还会把 URL 显示成
+  「缺 zip 文件名」的假象（`.../download/v2.1.2`），一度把排查方向带偏。修复分三层：
+  ① 打包期「判文本」的规则由扩展名白名单升级为**白名单 + 内容探测兜底**
+  （有 NUL 字节判二进制，否则尝试 UTF-8 解码，与 Git 同款启发式），并对所有判定为
+  文本的文件做 LF 规范化（规范化文件数 71 → 72，多出的正是 `lxserver.version`）；
+  ② `verify_eol_clean()` 打包门禁原先复用**同一个** `_is_text_file()` 且不传文件内容，
+  漏判口径与打包期完全一致 → 门禁「假安全」。现改为先读取内容再判定，与打包期严格同源；
+  ③ 新增 `.gitattributes`（`* text=auto eol=lf`，二进制类型显式 `binary`）从源头阻断
+  autocrlf 转换，并新增 `scripts/check_eol.py` 接入 CI 两道门禁。
+- **lxserver 引入步骤去除转义引号表达（构建加固）**：Dockerfile 原先用 `\"\"` 作为
+  「官方源」占位符表达下载回退链，在 compose 变量展开 / BuildKit 引号处理下会被破坏
+  （实测 `_chain` 展开为 `""" https://...`）。它并非上述安装失败的最终根因，但属真实
+  隐患，已改为**不使用任何引号技巧**：独立 `try_url()` 函数 + 空元素过滤表达回退链，
+  官方源单独放到最后重试。
+- **推荐歌单/账号歌单曲目点开播放显示「未知曲目」「未知歌手」**：发现页各平台推荐歌单、
+  网易账号歌单、每日/热门推荐下发的曲目**从未走过搜索**，因此 `proxy/app.py` 的
+  `_online_info()` 第一步 `_retained_track()`（只查 `_SEARCH_CACHE`）必然落空；第二步转发到
+  lxmusic-service `/api/v1/track/info` 时，该接口只对「自己搜索过的」曲目有缓存，未命中即
+  用 `lxserver_client.synthesize_song_info()` 合成占位值 —— 即用户看到的
+  `未知曲目` / `未知歌手`，是上游兜底常量，**不是飞牛客户端的 bug**。
+  新增 `proxy/online_registry.py`：在**下发曲目列表时**把真实元数据登记进内存表并节流落盘
+  （`recommend_cache/online-track-index.json`，14 天 TTL，8000 条上限，超出按最久未访问淘汰），
+  `_online_info()` 的**全部 return 路径**统一过一遍 `REGISTRY.apply()`，用登记值替换占位值 ——
+  仅在标题/歌手/专辑/时长/封面为占位或空时回填，**绝不覆盖上游真实数据**，因此搜索结果等
+  既有链路行为完全不变。登记点三处：发现页平台歌单、网易账号歌单、每日/热门推荐。
+- **compose 空值 build arg 覆盖 Dockerfile 默认值**：`docker-compose.yml` 曾以
+  `PIP_FALLBACK_INDEXES: ${FNMUSIC_PIP_FALLBACK_INDEXES:-}` 形式透传备用源链，空值会
+  以**空串**覆盖 Dockerfile 内 `ARG` 的默认值（并破坏 ARG 里的引号）。已从 compose
+  移除这两项透传，改由构建层 shell 兜底（`${VAR:-内置默认}`），并在 Dockerfile 中
+  把 ARG 默认值改为不带引号。
+- **离线 lxserver 包随 fpk 分发**：`container/lxserver-artifact/*.zip` 原先被目录内
+  `.gitignore`（`*.zip`）排除，仓库中只有 `.placeholder`，导致 Docker 构建时必然
+  需要联网下载（国内弱网/被墙时必失败）。现已将校验过的 zip 放入构建上下文并随
+  fpk 内层归档分发，构建时**优先使用预置包、零网络请求**；仅当预置包缺失时才走
+  镜像加速回退链。
+- **安装期 Docker 构建弱网加固**：apt/pip 源由「主源 → 官方源」二段回退改为**多级源链**
+  （主源失败后依次重试多个国内备用源，官方源沉底兜底），并显式收紧 pip 超时/重试
+  （`--timeout 30 --retries 2`），避免弱网下单源耗满默认 15s×5 把安装卡死。
+  apt 的源替换改为按 `URIs:`/`deb` 行整行重写（原先按域名特征匹配，切到第二个镜像后
+  会失配导致后续切换静默失效）。全部源链失败时输出明确排查指引。
+
+### 开发
+
+- **安装失败诊断脚本**：新增 `scripts/diagnose_install.sh`（只读）。采集安装日志、
+  Docker 版本/daemon.json、宿主机 DNS 与关键域名解析、宿主机与容器内网络连通性、
+  现有镜像/容器与磁盘占用，生成一份可直接回帖的报告，用于定位构建卡住的具体步骤。
+- **行尾门禁脚本**：新增 `scripts/check_eol.py`。检查仓库工作区与打包上下文里所有
+  「文本」文件是否为 LF（判文本口径与打包脚本同源），`--fpk X.fpk` 可额外解开 fpk
+  外层归档与内层 `app.tgz` 逐文件校验；已接入 CI 的两道门禁，同时在
+  `packaging/fpk/build_win.py` 打包末尾强制自检，产物不合规直接失败而不是产出坏包。
+- **在线曲目元数据登记表测试**：新增 `proxy/tests/test_online_registry.py`（16 例），
+  覆盖元数据提取（本地 guid 拒绝、三个显示字段全占位拒绝）、存取往返、批量登记过滤、
+  `apply()` 回填语义、**不覆盖上游真实值**、无登记时透传、持久化与重载、TTL 过期、
+  索引损坏降级，以及端到端回归「歌单曲目 → `/music/api/v1/track/metadata` 必须给出
+  真实标题/歌手而非 `未知曲目`」。
+- **Windows 原生 fpk 打包脚本**：新增 `packaging/fpk/build_win.py`，在没有
+  rsync / WSL / Docker / fnpack 的 Windows 环境下也能产出结构等价的
+  `dist/fnmusic-ext-<版本>.fpk`（含 `.sha256`）。产物契约与 `build.sh`+fnpack 一致：
+  内层 `app.tgz` 条目带 `./` 前缀、外层条目无前导 `./` 且目录在前、`manifest.checksum`
+  = app.tgz 的 md5、脚本权限位取自 git index、载荷排除表与 `build.sh` 的 rsync 规则对齐；
+  同样会内嵌 `packaging/fpk/.build/cache/` 中的 lxserver 预编译包以支持 NAS 离线安装。
+
 ## [2.7.0] - 2026-10-09
 
 自 2.6.3 以来的全部变更收拢为本次正式版发布（涵盖 2.7.0a、2.7.0b、2.7.0c 迭代改进）。

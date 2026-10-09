@@ -4,10 +4,18 @@ from __future__ import annotations
 import importlib.util
 import json
 import socket
+import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+
+import pytest
+
+# UDS 网关本体就是 POSIX 专属能力（Windows 无 socket.AF_UNIX）
+pytestmark = pytest.mark.skipif(
+    sys.platform == "win32", reason="UDS（AF_UNIX）仅 POSIX（CI/Linux 覆盖）"
+)
 
 _SPEC = importlib.util.spec_from_file_location(
     "webui_gateway", Path(__file__).resolve().parents[1] / "webui_gateway.py")

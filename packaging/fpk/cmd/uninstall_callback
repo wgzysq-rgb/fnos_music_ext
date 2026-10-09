@@ -13,4 +13,8 @@ docker rm -f fnmusic-sources >> "${FNMUSIC_LOG}" 2>&1 || true
 FNMUSIC_DEPLOYMENT_FILE="${FNMUSIC_DEPLOYMENT_FILE:-/var/lib/fnmusic-ext/deployment}"
 rm -f "${FNMUSIC_DEPLOYMENT_FILE}"
 
+# 安装期状态随卸载一并清空：此后重新安装应回到向导的「初始音源」选择，
+# 不能被上一次安装的快照顶替（详见 _common 的音源快照说明）。
+fnmusic_clear_source_snapshot
+
 exit 0

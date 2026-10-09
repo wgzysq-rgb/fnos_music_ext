@@ -101,10 +101,23 @@ fnmusic_cleanup_sources_container() {
 }
 
 fnmusic_env_source() {
-    # 0 when the selected audio source recorded in .env matches $1.
+    # 0 when the selected audio source recorded in .env is enabled.
+    #
+    # 注意 .env 的值一律是单引号包裹的（install.sh 与 WebUI 都经
+    # env_merge.quote_env_value 写出：FNMUSIC_LX_ENABLED='true'）。此前这里只认裸
+    # KEY=true —— 真实 .env 永远匹配不上，fnmusic_saved_source() 因而恒为空，
+    # 升级/重装一律回落 musicdl 聚合音源，把用户在管理页选好的洛雪自定义源静默重置
+    # （推荐歌单曲目 id 是 lx: 形态 → 取流 404 → App 一播就跳下一首）。
+    # 这里统一剥离 export 前缀 / 引号 / 空白再比对，单引号、双引号、裸值都兼容。
     [ -n "${FNMUSIC_REPO_DIR}" ] && [ -f "${FNMUSIC_REPO_DIR}/.env" ] || return 1
-    local key="$1"
-    grep -q "^${key}=true" "${FNMUSIC_REPO_DIR}/.env" 2>/dev/null
+    local key="$1" raw
+    raw="$(sed -n "s/^[[:space:]]*export[[:space:]]*${key}=//p;s/^[[:space:]]*${key}=//p" \
+        "${FNMUSIC_REPO_DIR}/.env" 2>/dev/null | tail -n1 \
+        | tr -d "'\"[:space:]" | tr '[:upper:]' '[:lower:]')"
+    case "${raw}" in
+        true|1|yes) return 0 ;;
+        *) return 1 ;;
+    esac
 }
 
 fnmusic_saved_source() {
@@ -116,8 +129,54 @@ fnmusic_saved_source() {
 }
 
 fnmusic_saved_lx_url() {
+    # 同样必须剥引号：带引号的值作为 --lx-source-url 传给 install.sh 时不匹配
+    # http(s):// / file:// 分支，会被当成「本机 .js 文件路径」→ [ ! -f ... ] →
+    # log_err 并直接中止升级/安装。
     [ -f "${FNMUSIC_REPO_DIR}/.env" ] || return 0
-    sed -n 's/^LX_SOURCE_URL=//p' "${FNMUSIC_REPO_DIR}/.env" | tail -n1
+    sed -n "s/^[[:space:]]*export[[:space:]]*LX_SOURCE_URL=//p;s/^[[:space:]]*LX_SOURCE_URL=//p" \
+        "${FNMUSIC_REPO_DIR}/.env" 2>/dev/null | tail -n1 | tr -d "'\"[:space:]"
+}
+
+# --- 已安装音源的持久快照 ---------------------------------------------------
+# 应用中心重装/升级会重建 target/，repo/.env（音源记录所在）可能先被清掉，而
+# FNMUSIC_MUSICDL_ENABLED / FNMUSIC_LX_ENABLED 属于 install.sh 的「安装时部署选项」
+# （始终以本次安装的值覆盖 .env）。两者叠加就会把用户在管理页设好的音源静默重置回
+# musicdl 聚合音源。快照放在应用目录之外，重装时才能沿用用户此前的选择。
+# FNMUSIC_SOURCE_SNAPSHOT 仅供测试注入；生产路径固定 /var/lib/fnmusic-ext。
+
+fnmusic_source_snapshot_path() {
+    echo "${FNMUSIC_SOURCE_SNAPSHOT:-/var/lib/fnmusic-ext/installed-source}"
+}
+
+fnmusic_write_source_snapshot() {
+    local value="$1" path
+    case "${value}" in
+        musicdl|musicbox|lxmusic) ;;
+        *) return 0 ;;
+    esac
+    path="$(fnmusic_source_snapshot_path)"
+    mkdir -p "$(dirname "${path}")" 2>/dev/null || return 0
+    printf '%s\n' "${value}" > "${path}" 2>/dev/null || true
+}
+
+fnmusic_snapshot_source() {
+    # 已安装音源：优先 .env（管理页切源即写这里，最新），其次持久快照（重装后被清 .env 时兜底）。
+    local saved
+    saved="$(fnmusic_saved_source)"
+    if [ -z "${saved}" ]; then
+        local path
+        path="$(fnmusic_source_snapshot_path)"
+        [ -f "${path}" ] && saved="$(head -n1 "${path}" 2>/dev/null | tr -d '[:space:]')"
+    fi
+    case "${saved}" in
+        musicdl|musicbox|lxmusic) echo "${saved}" ;;
+        *) echo "" ;;
+    esac
+}
+
+fnmusic_clear_source_snapshot() {
+    # 卸载即清空安装期状态：重装（先卸载）应回到向导的初始音源选择。
+    rm -f "$(fnmusic_source_snapshot_path)" 2>/dev/null || true
 }
 
 fnmusic_data_items() {

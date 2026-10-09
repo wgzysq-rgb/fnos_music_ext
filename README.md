@@ -23,6 +23,7 @@ GitHub：https://github.com/javycoder/fnos_music_ext
 - **自动下载封面**：自动保存到本地曲库的歌曲（边听边存 / 收藏自动绑定本地）落库后自动把封面内嵌进音频文件，飞牛音乐 App 里下载的歌即有封面图（可在 WebUI 关闭）；
 - **自动下载歌词**（v2.6.0 起，默认关）：自动保存到本地曲库的歌曲在完整下载成功后，自动下载同名 `.lrc` 歌词放到歌曲同一个文件夹，官方 App 扫描入库后播放即显示歌词；下载失败不产生歌词文件（可在 WebUI 开启）；
 - **推荐体系**：「热门推荐」与「每日推荐 MM-DD」两个独立歌单、独立开关；默认采信音源原生推荐，未启用网易时可配 OpenAI 兼容大模型兜底；歌单封面取列表里第一首有封面的曲目；
+- **平台推荐歌单（发现）**（v2.7.1 起，默认关）：把各平台的推荐歌单（QQ 歌单广场 / 网易 / 酷我 / 酷狗 / 咪咕）注入歌单列表，点开即听该平台歌单曲目；播放走已激活的洛雪源，属公共内容不读个人历史与收藏；
 - **网易账号歌单**（v2.6.0 起，默认关）：网易盒子扫码登录后，账号里自己创建的歌单以只读歌单出现在音乐页「热门推荐」下方、官方歌单上方，点开即听（曲目经可播过滤）；在音乐页加歌/移歌/删除不回写网易；
 - **多用户隔离收藏**：家庭多成员的红心收藏彼此独立，与本地曲库融合。
 
@@ -145,8 +146,10 @@ curl -s --unix-socket /var/run/trim_music.socket http://localhost/_ext/healthz
 | `FNMUSIC_TEE_CACHE_MAX` | `2` | 关闭边听边存时滚动保留的试听缓存条数（仅关闭时生效） |
 | `FNMUSIC_TRANSCODE_ENABLED` | `true` | App 音质偏好为"标准"时在线歌曲由 ffmpeg 实时转码 AAC 分片流播放（热重载）；配套 `FNMUSIC_TRANSCODE_BITRATE`（128k）、`_HLS_TIME`（10 秒/片）、`_MAX_SESSIONS`（并发 2）、`_TTL_S`（停止心跳 90 秒后回收）、`_CACHE_MAX_MB`（转码缓存 512MB，最久未用先清）、`_DL_BITRATE`（转码下载标准档 320k，与官方一致） |
 | `FNMUSIC_AUTO_COVER` | `true` | 自动下载封面：落库歌曲自动内嵌源站封面，官方 App 显示封面图（热重载） |
+| `FNMUSIC_COVER_PROXY` | `true` | 封面代理缓存（NAS）：在线歌曲封面由扩展代取并缓存到本地，修复电脑网页封面加载不出（热重载）；配套 `FNMUSIC_COVER_CACHE_DIR`（留空 = `<cache>/covers`）、`FNMUSIC_COVER_CACHE_MAX`（缓存数上限 2000，最旧先清） |
 | `FNMUSIC_LYRIC_AUTO_DL` | `false` | 自动下载歌词：歌曲完整落库成功后自动下载同名 `.lrc` 到歌曲所在目录（热重载） |
 | `FNMUSIC_RECOMMEND_HOT` / `FNMUSIC_RECOMMEND_DAILY` | `true` | 「热门推荐」/「每日推荐」两个独立歌单的开关（热重载） |
+| `FNMUSIC_RECOMMEND_PLAYLIST` | `false` | 平台推荐歌单（发现）：把 QQ/网易/酷我/酷狗/咪咕的推荐歌单注入歌单列表（热重载）；配套 `_SOURCE`（平台白名单，空=全部）、`_PAGE_SIZE`（每平台数量，1-30，默认 12） |
 | `FNMUSIC_NETEASE_MY_PLAYLISTS` | `false` | 网易账号歌单：启用网易盒子并扫码登录后，账号自建歌单以只读歌单出现在音乐页「热门推荐」下方（热重载） |
 | `FNMUSIC_COVER_ENRICH` | `true` | 缺失封面用网易曲库补全（热重载） |
 | `FNMUSIC_LLM_BASE_URL` 等 | *(空)* | 大模型每日推荐兜底（OpenAI 兼容，热重载） |
@@ -177,6 +180,11 @@ git pull
 - **WebUI 打不开**：确认安装时选择了 WebUI，或 `.env` 中 `FNMUSIC_WEBUI_ENABLED=true` 后运行 `./extend.sh`。用飞牛管理员打开桌面「fnMusic 扩展管理」或 `/app/fnmusic-ext`，不要直接访问 8774。
 - **洛雪源播放失败**：源脚本由第三方提供，在容器内执行。导入前必须自行确认来源安全，不要导入来历不明的脚本。可在 WebUI 中用「测试」按钮验证源可用性，失败时更换源 URL 或重新上传脚本文件。
 - **musicdl 某平台搜索为空**：上游接口变化所致，不影响其他平台；可升级 musicdl（`>=2.13.11`）后重建镜像。
+- **安装卡在「Docker 镜像构建或启动失败」**：多为构建容器联网受限（apt/pip 拉取超时）。安装器已内置多级镜像源链（主源失败自动依次重试国内备用源，官方源沉底），仍失败时可：
+  1. 在 `.env` 里换主源：`FNMUSIC_PIP_INDEX` / `FNMUSIC_APT_MIRROR`；
+  2. 自定义备用链：`FNMUSIC_PIP_FALLBACK_INDEXES` / `FNMUSIC_APT_FALLBACK_MIRRORS`（空格分隔，填镜像站根地址）；
+  3. 给 Docker daemon 配代理（`/etc/docker/daemon.json` 的 `proxies` 段）后重试；
+  4. 运行 `sudo bash scripts/diagnose_install.sh` 采集只读诊断报告（含安装日志、DNS、容器内网络连通性），据此定位具体卡住的步骤。
 - **切源后内存没有变化**：切换在容器内完成，`docker stats fnmusic-sources` 稍等片刻后查看；未启用音源进程会被停止而非休眠。
 - **改了 `.env` 不生效**：热重载仅覆盖白名单键（音源开关/音质/推荐/边听边存/LLM 等）；路径、端口、平台白名单类改动需执行 `./extend.sh` 重启容器。
 
@@ -193,6 +201,15 @@ python3 -m pytest        # 全量测试（无需 Docker/飞牛环境）
 ```bash
 ./packaging/fpk/build.sh   # 本地打包：组装 + fnpack 校验 → dist/fnmusic-ext-<版本>.fpk
 ```
+
+Windows 上没有 rsync / WSL / Docker 时，用等价的原生打包脚本（无需 fnpack）：
+
+```powershell
+python packaging/fpk/build_win.py              # → dist/fnmusic-ext-<版本>.fpk + .sha256
+python packaging/fpk/build_win.py --stage-only D:\tmp\stage   # 只组装不打包
+```
+
+两者产物结构一致（内层 `app.tgz` 带 `./` 前缀、外层条目无前导 `./` 且目录在前、`manifest.checksum` = app.tgz 的 md5、脚本权限位取自 git index）。若 `packaging/fpk/.build/cache/` 放了对应 `lxserver.version` 的预编译包，会一并内嵌以实现 NAS 离线安装。
 
 - 版本号唯一来源为根目录 `VERSION`，打包时注入 manifest；
 - CI 在每次 push/PR 都会构建一次 fpk 防止结构回归；推送 `v<版本>` tag 会自动构建并把 `.fpk` 与校验和发布到 GitHub Release（tag 需与 `VERSION` 一致）；

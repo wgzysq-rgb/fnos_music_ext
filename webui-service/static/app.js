@@ -116,8 +116,12 @@ function applyConfigToForm() {
   $$("input[name=quality]").forEach((el) => { el.checked = el.value === quality; });
   $("#recommend-hot").checked = v.FNMUSIC_RECOMMEND_HOT === "true";
   $("#recommend-daily").checked = v.FNMUSIC_RECOMMEND_DAILY === "true";
+  $("#recommend-playlist").checked = v.FNMUSIC_RECOMMEND_PLAYLIST === "true";
+  $("#recommend-playlist-source").value = v.FNMUSIC_RECOMMEND_PLAYLIST_SOURCE || "";
+  $("#recommend-playlist-size").value = v.FNMUSIC_RECOMMEND_PLAYLIST_PAGE_SIZE || "12";
   $("#tee-enabled").checked = v.FNMUSIC_TEE_SAVE_ENABLED === "true";
   $("#auto-cover").checked = v.FNMUSIC_AUTO_COVER !== "false";
+  $("#cover-proxy").checked = v.FNMUSIC_COVER_PROXY !== "false";
   $("#lyric-auto-dl").checked = v.FNMUSIC_LYRIC_AUTO_DL === "true";
   $("#fav-autobind").checked = v.FNMUSIC_FAV_AUTO_BIND === "true";
   $("#tee-dir").value = v.FNMUSIC_TEE_SAVE_DIR || "";
@@ -169,8 +173,12 @@ function collectConfig() {
     FNMUSIC_QUALITY_MODE: ($$("input[name=quality]").find((el) => el.checked) || {}).value || "high",
     FNMUSIC_RECOMMEND_HOT: $("#recommend-hot").checked,
     FNMUSIC_RECOMMEND_DAILY: $("#recommend-daily").checked,
+    FNMUSIC_RECOMMEND_PLAYLIST: $("#recommend-playlist").checked,
+    FNMUSIC_RECOMMEND_PLAYLIST_SOURCE: $("#recommend-playlist-source").value.trim(),
+    FNMUSIC_RECOMMEND_PLAYLIST_PAGE_SIZE: parseInt($("#recommend-playlist-size").value || "12", 10) || 12,
     FNMUSIC_TEE_SAVE_ENABLED: $("#tee-enabled").checked,
     FNMUSIC_AUTO_COVER: $("#auto-cover").checked,
+    FNMUSIC_COVER_PROXY: $("#cover-proxy").checked,
     FNMUSIC_LYRIC_AUTO_DL: $("#lyric-auto-dl").checked,
     FNMUSIC_FAV_AUTO_BIND: $("#fav-autobind").checked,
     FNMUSIC_TEE_SAVE_DIR: $("#tee-dir").value.trim(),
@@ -682,8 +690,10 @@ if ($("#lx-name")) {
   $("#lx-name").addEventListener("input", () => markDirty());
 }
 $$("input[name=quality]").forEach((el) => el.addEventListener("change", () => markDirty("音质偏好需保存后生效")));
-["#recommend-hot", "#recommend-daily", "#search-probe", "#search-deep", "#tee-enabled", "#fav-autobind", "#auto-cover", "#lyric-auto-dl", "#netease-my-playlists"].forEach((sel) =>
+["#recommend-hot", "#recommend-daily", "#recommend-playlist", "#search-probe", "#search-deep", "#tee-enabled", "#fav-autobind", "#auto-cover", "#lyric-auto-dl", "#netease-my-playlists"].forEach((sel) =>
   $(sel).addEventListener("change", () => markDirty()));
+["#recommend-playlist-source", "#recommend-playlist-size"].forEach((sel) =>
+  $(sel).addEventListener("input", () => markDirty()));
 
 function updateTeeCountLabel() {
   const n = $("#tee-max").value || configValues.FNMUSIC_TEE_CACHE_MAX || "2";

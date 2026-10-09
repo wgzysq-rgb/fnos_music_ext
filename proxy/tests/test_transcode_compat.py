@@ -75,11 +75,18 @@ def wait_for(pred, timeout: float = 8.0):
 
 @pytest.fixture
 def fake_ffmpeg(tmp_path, monkeypatch):
-    """装一个假 ffmpeg；用 mode 参数控制脚本行为（默认 ok）。"""
+    """装一个假 ffmpeg；用 mode 参数控制脚本行为（默认 ok）。
+
+    平台不能直接执行 .py 脚本（Windows 无 shebang 解释器映射，exec 报
+    WinError 193）时整组跳过：这些用例验证的是转码编排逻辑，不是 Windows
+    兼容性，硬跑只会产生 8 个恒定红。
+    """
     def _install(mode: str = "ok", segments: int = 40):
         script = tmp_path / "fake_ffmpeg"
         script.write_text(FAKE_FFMPEG_SRC)
         script.chmod(0o755)
+        if not _fake_ffmpeg_runnable(str(script)):
+            pytest.skip("本机不能直接执行 Python 假 ffmpeg（如 Windows WinError 193）")
         monkeypatch.setattr(tc, "FFMPEG_BIN", str(script))
         monkeypatch.setenv("FAKE_FFMPEG_MODE", mode)
         monkeypatch.setenv("FAKE_FFMPEG_SEGMENTS", str(segments))
@@ -866,3 +873,545 @@ def test_filter_headers_sanitizes_unicode_content_disposition():
     # 纯中文 filename 替换或 URL 编码，不保留裸中文
     assert "马頔" not in filtered["content-disposition"]
 
+
+# ---------------------------------------------------------------------------
+# 声明分片数自愈（2026-10-09 播放回归）
+#
+# 背景：转码 playlist 由服务端按 floor(duration_s/hls_time) 预合成，正确性依赖
+# 「声明分片数 == ffmpeg 实际产出数」。该等式只在 duration_s 来自真实时长时成立
+# —— 一旦上游用估算时长（如歌单接口标注时长）传入就会两个方向都坏：
+#   声明数 > 实际数 → App 拉 404 分片 → 整首跳下一首；
+#   声明数 < 实际数 → playlist 提前结束 → 后半段被丢掉、进度条走不满就跳曲。
+# 历史 state 是落盘的，因此复用前必须按磁盘真实分片数同步。
+# 关键：自愈挂在 `_usable_cache()` 这个统一读出口——ensure_session 与
+# peek_cached 都经过它。只挂 ensure_session 会漏掉「重启后直接拉 playlist」
+# 那条（`_transcode_live()` → `peek_cached()`），历史坏会话照样跳曲。
+# ---------------------------------------------------------------------------
+
+def _mk_session(tmp_path, guid, segments, declared, duration_s=220.0, hls_time=10.0):
+    directory = tc.session_dir(str(tmp_path), guid)
+    os.makedirs(directory, exist_ok=True)
+    with open(os.path.join(directory, tc.INIT_NAME), "wb") as f:
+        f.write(b"ftypinit")
+    for i in range(segments):
+        with open(os.path.join(directory, "%05d.m4s" % i), "wb") as f:
+            f.write(b"seg")
+    with open(os.path.join(directory, tc.STATE_NAME), "w", encoding="utf-8") as f:
+        json.dump({"guid": guid, "status": "done", "duration_s": duration_s,
+                   "hls_time": hls_time, "declared_count": declared}, f)
+    return directory
+
+
+def test_heal_declared_count_clamps_when_over_declared(tmp_path):
+    """声明数多于实际分片（估算时长导致）→ 收敛到实际数，避免 App 拉 404。"""
+    d = _mk_session(tmp_path, "online:lx:wy:1", segments=20, declared=22)
+    healed = tc._heal_declared_count(d, tc._read_state(d))
+    assert healed["declared_count"] == 20
+    # duration 同步收敛，保证 /preset.m3u8 最后一个 EXTINF 不虚高
+    assert healed["duration_s"] == 200.0
+
+
+def test_heal_declared_count_syncs_up_to_actual(tmp_path):
+    """声明数少于实际分片（估算时长偏短）→ 同步到实际数，否则歌会被提前截断。"""
+    d = _mk_session(tmp_path, "online:lx:wy:2", segments=24, declared=20,
+                    duration_s=200.0)
+    healed = tc._heal_declared_count(d, tc._read_state(d))
+    assert healed["declared_count"] == 24
+    assert healed["duration_s"] == 240.0
+
+
+def test_heal_declared_count_noop_when_consistent(tmp_path):
+    """声明数与实际一致时不改动（含 duration_s）。"""
+    d = _mk_session(tmp_path, "online:lx:wy:5", segments=20, declared=20,
+                    duration_s=200.0)
+    healed = tc._heal_declared_count(d, tc._read_state(d))
+    assert healed["declared_count"] == 20
+    assert healed["duration_s"] == 200.0
+
+
+def test_heal_declared_count_noop_without_segments(tmp_path):
+    """磁盘上没有任何分片时不改声明值（交由调用方决定，避免误清缓存）。"""
+    d = _mk_session(tmp_path, "online:lx:wy:3", segments=0, declared=25)
+    healed = tc._heal_declared_count(d, tc._read_state(d))
+    assert healed["declared_count"] == 25
+
+
+def test_count_segments_ignores_non_segment_files(tmp_path):
+    d = _mk_session(tmp_path, "online:lx:wy:4", segments=3, declared=3)
+    for junk in ("init.mp4", "00003.m4s.tmp", "abc.m4s", "state.json", "123456.m4s"):
+        with open(os.path.join(d, junk), "wb") as f:
+            f.write(b"x")
+    assert tc._count_segments(d) == 3
+
+
+def test_ensure_session_reuses_healed_count(tmp_path, monkeypatch):
+    """播放路径复用的会话必须已自愈（响应 /preset.m3u8 的声明数）。"""
+    monkeypatch.setattr(tc, "FFMPEG_BIN", "/nonexistent/ffmpeg")
+    d = _mk_session(tmp_path, FAKE_KUWO, segments=18, declared=23, duration_s=230.0)
+
+    sess = asyncio.run(tc.ensure_session(
+        FAKE_KUWO, "http://example.com/a.mp3", 230.0, root=str(tmp_path)))
+    assert sess is not None and sess.status == "done"
+    assert sess.declared_count == 18
+    text = tc.playlist_text(sess)
+    assert text.count(".m4s") == 18
+
+
+def test_usable_cache_returns_healed_state(tmp_path):
+    """自愈挂在统一读出口上；落盘 state 保持原样（纯函数，不回写磁盘）。"""
+    d = _mk_session(tmp_path, "online:lx:wy:6", segments=20, declared=22)
+    assert tc._usable_cache(d)["declared_count"] == 20
+    assert tc._read_state(d)["declared_count"] == 22
+
+
+def test_peek_cached_applies_heal(tmp_path):
+    """peek_cached 是重启后拉 playlist 的入口，必须同样拿到自愈后的声明数。"""
+    d = _mk_session(tmp_path, "online:lx:wy:7", segments=20, declared=22,
+                    duration_s=220.0)
+    sess = tc.peek_cached("online:lx:wy:7", str(tmp_path))
+    assert sess is not None and sess.directory == d
+    assert sess.declared_count == 20
+    assert tc.playlist_text(sess).count(".m4s") == 20
+
+
+def test_playlist_after_restart_counts_disk_segments(env):
+    """端到端：磁盘上留着坏会话时，重启后第一次拉 playlist 不得多声明分片。
+
+    2.7.2 的漏网点正在这里：自愈原先只挂在 ensure_session()，而重启后
+    `_transcode_live()` 直接走 `peek_cached()`，坏会话照样输出比实际多的
+    声明分片数 → App 拉不存在的分片 404 → 整首跳下一首。
+    """
+    guid = appmod.resolve_real_guid(FAKE_KUWO)
+    directory = _mk_session(CONF["cache_dir"], guid, segments=20, declared=22,
+                            duration_s=220.0)
+    assert os.path.isdir(directory)
+    with TestClient(app) as client:
+        body = client.get(f"/music/api/v1/track/hls/{FAKE_KUWO}/preset.m3u8").text
+    assert body.count("#EXTINF") == 20
+    assert body.count(".m4s") == 20
+    assert "00020.m4s" not in body
+    assert "#EXT-X-ENDLIST" in body
+
+
+# === 下载/落库元数据：在线登记表回填（"下载到本地仍是未知歌手 - 未知曲目"） ===
+# 根因：落盘点只判"非空"，把 lxserver 合成的占位常量当有效元数据写进曲库文件名
+# 与文件标签；而登记表只在播放详情（_online_info）接入了，落盘链路全都没查。
+
+DISCOVER_GUID = "online:lx:wy:1974443814"
+DISCOVER_META = {
+    "guid": DISCOVER_GUID, "title": "夜曲", "artist": "周杰伦", "album": "十一月的萧邦",
+}
+UPSTREAM_PLACEHOLDER = {"title": "未知曲目", "artist": "未知歌手", "album": ""}
+
+
+@pytest.fixture
+def registry(tmp_path, monkeypatch):
+    """隔离进程级在线登记表 singleton + 歌单缓存目录（不扫本机真实缓存）。"""
+    from proxy import online_registry as onreg
+
+    monkeypatch.setenv("FNMUSIC_RECOMMEND_DIR", str(tmp_path / "recommend_cache"))
+    monkeypatch.setenv("FNMUSIC_NM_PLAYLISTS_DIR", str(tmp_path / "nm_playlists"))
+    onreg.REGISTRY.reset_for_tests(str(tmp_path / "online-track-index.json"))
+    yield onreg.REGISTRY
+    onreg.REGISTRY.reset_for_tests(str(tmp_path / "released.json"))
+
+
+def _seed_library_file(directory: str, name: str, data: bytes = b"MP3DATA" * 200) -> str:
+    path = os.path.join(directory, name)
+    with open(path, "wb") as f:
+        f.write(data)
+    return path
+
+
+def test_registry_is_placeholder_public():
+    from proxy import online_registry as onreg
+
+    assert onreg.is_placeholder("未知曲目") and onreg.is_placeholder("未知歌手")
+    assert onreg.is_placeholder("") and onreg.is_placeholder(None)
+    assert not onreg.is_placeholder("夜曲")
+
+
+def test_has_real_title_rejects_upstream_placeholder():
+    assert appmod._has_real_title(UPSTREAM_PLACEHOLDER) is False
+    assert appmod._has_real_title({"title": "夜曲"}) is True
+    assert appmod._has_real_title(None) is False
+    assert appmod._is_real_tag("未知歌手") is False
+    assert appmod._is_real_tag("周杰伦") is True
+
+
+def test_merge_missing_tags_replaces_placeholder():
+    merged = appmod._merge_missing_tags("未知曲目", "未知歌手", "", DISCOVER_META)
+    assert merged == ("夜曲", "周杰伦", "十一月的萧邦")
+    # 真实值不被登记值覆盖
+    assert appmod._merge_missing_tags("晴天", "周杰伦", "叶惠美", DISCOVER_META) == (
+        "晴天", "周杰伦", "叶惠美")
+
+
+def test_background_save_info_backfills_upstream_placeholder(registry, env):
+    registry.record(DISCOVER_META)
+    info = asyncio.run(appmod._info_for_background_save(
+        appmod._synth_request({}), DISCOVER_GUID, dict(UPSTREAM_PLACEHOLDER)))
+    assert (info["title"], info["artist"], info["album"]) == ("夜曲", "周杰伦", "十一月的萧邦")
+
+
+def test_tee_finalize_names_file_from_registry(registry, env):
+    """边听边存/整轨落盘带占位 info：文件名与标签都必须是登记表里的真名。"""
+    registry.record(DISCOVER_META)
+    lib = env["dirs"]["library"]
+    part = os.path.join(lib, f"{appmod.cache_safe_guid(DISCOVER_GUID)}.part")
+    with open(part, "wb") as f:
+        f.write(b"MP3DATA" * 200)
+    info = asyncio.run(appmod._info_for_background_save(
+        appmod._synth_request({}), DISCOVER_GUID, dict(UPSTREAM_PLACEHOLDER)))
+    meta = appmod._tee_finalize(part, DISCOVER_GUID, "mp3", info, True)
+    assert meta is not None
+    assert (meta["title"], meta["artist"]) == ("夜曲", "周杰伦")
+    assert os.path.basename(meta["dest"]) == "周杰伦 - 夜曲.mp3"
+    assert not any("未知" in n for n in os.listdir(lib))
+
+
+def test_download_heals_placeholder_named_library_file(registry, env):
+    """≤2.7.4 已落库的占位式文件：下载时就地自愈（标签 + 文件名 + 同名 .lrc）。"""
+    registry.record(DISCOVER_META)
+    lib = env["dirs"]["library"]
+    old = _seed_library_file(lib, "未知歌手 - 未知曲目.mp3")
+    with open(os.path.join(lib, "未知歌手 - 未知曲目.lrc"), "w", encoding="utf-8") as f:
+        f.write("[00:01.00]词")
+    appmod.remember_media_path(DISCOVER_GUID, old)
+    assert appmod.find_cache_file(DISCOVER_GUID) == old
+
+    served, healed = appmod._dl_tagged_media(DISCOVER_GUID, old)
+    assert healed is True
+    assert os.path.basename(served) == "周杰伦 - 夜曲.mp3"
+    assert os.path.isfile(served) and not os.path.exists(old)
+    assert os.path.isfile(os.path.join(lib, "周杰伦 - 夜曲.lrc"))
+    assert appmod.recalled_media_path(DISCOVER_GUID) == served
+
+
+def test_download_keeps_file_when_metadata_unresolvable(registry, env):
+    """登记表/缓存都查不到真名时原样供文件，绝不把占位值当文件名改写。"""
+    lib = env["dirs"]["library"]
+    old = _seed_library_file(lib, "未知歌手 - 未知曲目.mp3")
+    appmod.remember_media_path(DISCOVER_GUID, old)
+
+    served, healed = appmod._dl_tagged_media(DISCOVER_GUID, old)
+    assert served == old and healed is False
+    assert os.path.isfile(old)
+
+
+def test_download_rolling_cache_served_as_tagged_copy(registry, env):
+    """滚动缓存文件可能正被播放读取：不原地改写，另存带标签副本供下载。"""
+    registry.record(DISCOVER_META)
+    rolling = _seed_library_file(CONF["cache_dir"], f"{appmod.cache_safe_guid(DISCOVER_GUID)}.mp3")
+    assert appmod.find_cache_file(DISCOVER_GUID) == rolling
+
+    served, healed = appmod._dl_tagged_media(DISCOVER_GUID, rolling)
+    assert healed is True and served != rolling
+    assert served.endswith(".tagged.mp3") and os.path.isfile(served)
+    with open(rolling, "rb") as f:
+        assert f.read() == b"MP3DATA" * 200      # 播放缓存原文件字节不动
+
+
+def test_download_endpoint_serves_real_metadata_name(registry, env):
+    from urllib.parse import quote
+
+    registry.record(DISCOVER_META)
+    lib = env["dirs"]["library"]
+    old = _seed_library_file(lib, "未知歌手 - 未知曲目.mp3")
+    appmod.remember_media_path(DISCOVER_GUID, old)
+    with TestClient(app) as client:
+        did = client.post("/music/api/v1/download/track/transcode/prepare",
+                          json={"trackGUID": DISCOVER_GUID,
+                                "quality": "standard"}).json()["data"]["downloadId"]
+
+        def _ready():
+            st = client.get("/music/api/v1/download/track/transcode/status",
+                            params={"downloadId": did}).json()["data"]
+            return st if st["status"] == "ready" else None
+        assert wait_for(_ready) is not None
+
+        file_resp = client.get("/music/api/v1/download/track/transcode/file",
+                               params={"downloadId": did})
+        assert file_resp.status_code == 200
+        assert file_resp.content == b"MP3DATA" * 200          # 源已是 mp3：直接供原文件
+        # App 存到本地后的显示名来自这里（filename* 是 UTF-8 百分号编码）
+        assert quote("周杰伦 - 夜曲.mp3", encoding="utf-8") in file_resp.headers["content-disposition"]
+    assert not os.path.exists(old)
+    assert os.path.isfile(os.path.join(lib, "周杰伦 - 夜曲.mp3"))
+
+
+def _fake_ffmpeg_runnable(script: str) -> bool:
+    """本机能否直接执行假 ffmpeg（Python 脚本）。
+
+    Windows 没有 shebang 解释器映射，exec 一个 .py 会 WinError 193；转码链路
+    用例据此跳过，避免把平台限制报成功能缺陷。
+    """
+    try:
+        subprocess.run([script, "-f", "null", "-"], check=True,
+                       capture_output=True, timeout=30)
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def test_download_transcoded_output_tagged_from_registry(registry, env, monkeypatch):
+    """转码产物被 `-map_metadata -1` 清空标签后必须补写真实元数据（不依赖真 ffmpeg）。"""
+    registry.record(DISCOVER_META)
+    lib = env["dirs"]["library"]
+    src = _seed_library_file(lib, "未知歌手 - 未知曲目.flac", b"FLACDATA" * 400)
+    target = os.path.join(CONF["cache_dir"], "dlout.mp3")
+    calls: list[tuple] = []
+    monkeypatch.setattr(appmod, "write_audio_tags",
+                        lambda p, t, a="", al="": calls.append((os.path.basename(p), t, a, al)))
+    asyncio.run(appmod._dl_tag_transcoded(DISCOVER_GUID, src, target))
+    assert calls == [("dlout.mp3", "夜曲", "周杰伦", "十一月的萧邦")]
+
+
+def test_download_transcode_output_gets_real_tags(registry, env, fake_ffmpeg, monkeypatch):
+    """端到端：标准档下载全程走通，转码产物与下载文件名都是真实元数据。"""
+    script = fake_ffmpeg("ok")
+    if not _fake_ffmpeg_runnable(script):
+        pytest.skip("本机不能直接执行 Python 假 ffmpeg（Windows WinError 193）")
+    registry.record(DISCOVER_META)
+    seed_cached_audio(DISCOVER_GUID, b"FLACDATA" * 400, ext="flac")
+    calls: list[tuple] = []
+    monkeypatch.setattr(appmod, "write_audio_tags",
+                        lambda p, t, a="", al="": calls.append((os.path.basename(p), t, a, al)))
+    with TestClient(app) as client:
+        did = client.post("/music/api/v1/download/track/transcode/prepare",
+                          json={"guid": DISCOVER_GUID,
+                                "quality": "standard"}).json()["data"]["downloadId"]
+
+        def _ready():
+            st = client.get("/music/api/v1/download/track/transcode/status",
+                            params={"downloadId": did}).json()["data"]
+            return st if st["status"] == "ready" else None
+        st = wait_for(_ready)
+        assert st is not None and st["percent"] == 100
+
+        file_resp = client.get("/music/api/v1/download/track/transcode/file",
+                               params={"downloadId": did})
+        assert file_resp.content.startswith(b"M4ADATA")        # 假 ffmpeg 产物
+        from urllib.parse import quote
+
+        assert quote("周杰伦 - 夜曲.mp3", encoding="utf-8") in file_resp.headers["content-disposition"]
+    assert (f"{appmod.cache_safe_guid(DISCOVER_GUID)}.mp3", "夜曲", "周杰伦", "十一月的萧邦") in calls
+
+
+# === 元数据出口矩阵：列表接口 / 上报写入 / 兜底链（"播放详情修好了，列表还是未知"）===
+# 系统性回归：**所有**会下发在线曲目展示名的出口都必须接同一张在线登记表 + 同一套
+# 「占位即缺失」判定。用同一份脏数据打到全部出口，任何出口（含以后新增的）漏接
+# 回填都会在这里直接红，不再靠"改一处、漏一处"。
+
+OFFICIAL_PLAYLIST = "pl-official-meta"
+OFFICIAL_TRACK_ITEM = {
+    "guid": "local:101",
+    "title": "夜的第七章",
+    "artists": [{"name": "周杰伦", "guid": "local:artist:1"}],
+    "album": {"name": "依然范特西", "guid": "local:album:1"},
+    "duration": 226000,
+    "isFavorite": True,
+}
+MIGU_GUID = "online:migu:600908"
+MIGU_META = {"guid": MIGU_GUID, "title": "稻香", "artist": "周杰伦", "album": "魔杰座"}
+
+
+def _placeholder_snapshot(guid: str) -> dict:
+    """<=2.7.5 落盘的脏快照形状：上游占位值 + 空专辑 + VO 形态（artists 数组/毫秒时长）。"""
+    return {
+        "guid": guid,
+        "title": "未知曲目",
+        "artists": [{"name": "未知歌手", "guid": f"{guid}:artist", "coverId": None}],
+        "album": {"name": "", "guid": f"{guid}:album", "coverId": guid},
+        "audioSpec": {"format": "mp3", "size": 0, "duration": 200000},
+        "duration": 200000,
+        "duration_s": 200.0,
+        "ext": "mp3",
+        "coverId": guid,
+        "createdAt": 1,
+        "updatedAt": 1,
+    }
+
+
+def _matrix_upstream():
+    """列表接口用的上游：user/me 已登录，三条列表各回一条官方条目（作结构模板）。"""
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path.endswith("/user/me"):
+            return httpx.Response(200, json={"code": 0, "msg": "ok", "data": {"guid": "user-a"}})
+        if path in ("/music/api/v1/favorite-track/list",
+                    "/music/api/v1/play-history/list",
+                    "/music/api/v1/track/playlist-detail/list"):
+            return httpx.Response(200, json={
+                "code": 0, "msg": "ok",
+                "data": {"list": [dict(OFFICIAL_TRACK_ITEM)], "total": 1},
+            })
+        return httpx.Response(200, json=SENTINEL)
+
+    return httpx.AsyncClient(transport=httpx.MockTransport(handler), base_url="http://unix")
+
+
+def test_build_favorite_track_obj_applies_registry(registry):
+    """列表条目的 VO 构造器必须自己做登记表回填（单一收口点）。"""
+    guid = DISCOVER_GUID
+    registry.record(dict(DISCOVER_META))
+    vo = appmod.build_favorite_track_obj(
+        guid, appmod._snapshot_to_info(_placeholder_snapshot(guid)))
+    assert vo["title"] == "夜曲"
+    assert vo["artists"][0]["name"] == "周杰伦"
+    assert vo["album"]["name"] == "十一月的萧邦"
+
+
+def test_heal_stored_meta_falls_back_to_playlist_cache(registry, env):
+    """登记表没有（重启后/TTL 过期）时，从推荐歌单磁盘缓存自愈。"""
+    guid = DISCOVER_GUID
+    cache_dir = os.environ["FNMUSIC_RECOMMEND_DIR"]
+    os.makedirs(cache_dir, exist_ok=True)
+    with open(os.path.join(cache_dir, "user-a_daily.json"), "w", encoding="utf-8") as f:
+        json.dump({"tracks": [{
+            "guid": guid, "title": "夜曲", "artist": "周杰伦", "album": "十一月的萧邦",
+        }]}, f)
+
+    healed = appmod._heal_stored_meta(guid, appmod._snapshot_to_info(_placeholder_snapshot(guid)))
+    assert appmod._tag_fields(healed) == ("夜曲", "周杰伦", "十一月的萧邦")
+    # 真值不被缓存覆盖
+    kept = appmod._heal_stored_meta(guid, {"title": "晴天", "artist": "周杰伦"})
+    assert appmod._tag_fields(kept)[:2] == ("晴天", "周杰伦")
+    # 两级都查不到：保持原样，不臆造
+    assert appmod._heal_stored_meta("online:migu:600999", {}) == {}
+
+
+def test_lookup_online_snapshot_prefers_real_over_placeholder(registry, env):
+    """历史里的占位旧快照不能挡住收藏里的真名。"""
+    from proxy import recommend as dailyrec
+
+    guid = DISCOVER_GUID
+    dailyrec.record_online_play("user-a", guid, _placeholder_snapshot(guid))
+    appmod.save_online_favorites("user-a", [{"guid": guid, "createdAt": 1, "track": {
+        "guid": guid, "title": "夜曲", "artist": "周杰伦", "album": "十一月的萧邦",
+    }}])
+    assert appmod._lookup_online_snapshot(guid)["title"] == "夜曲"
+
+
+def test_best_effort_online_info_ignores_placeholder_filename(registry, env, monkeypatch):
+    """占位式文件名（旧版本落库产物）不是元数据来源，绝不写进收藏/歌单快照。"""
+    async def no_info(request, guid, include_lyric=True):
+        return None
+
+    monkeypatch.setattr(appmod, "_fetch_online_info", no_info)
+    lib = env["dirs"]["library"]
+    old = _seed_library_file(lib, "未知歌手 - 未知曲目.mp3")
+    appmod.remember_media_path(DISCOVER_GUID, old)
+    info = asyncio.run(appmod._best_effort_online_info(
+        appmod._synth_request({}), DISCOVER_GUID))
+    assert not appmod._is_real_tag(info.get("title"))
+    assert not appmod._is_real_tag(info.get("artist"))
+
+    # 真名文件名仍然可用（回归：兜底能力不能被删掉）
+    real = _seed_library_file(lib, "周杰伦 - 晴天.mp3")
+    appmod.remember_media_path(MIGU_GUID, real)
+    info = asyncio.run(appmod._best_effort_online_info(
+        appmod._synth_request({}), MIGU_GUID))
+    assert (info.get("title"), info.get("artist")) == ("晴天", "周杰伦")
+
+
+def test_play_history_write_backfills_from_registry(registry, env):
+    """上报写入侧：事件不带元数据时用登记表回填，否则脏条目会钉死在"最近播放"里。"""
+    from proxy import recommend as dailyrec
+
+    registry.record(dict(DISCOVER_META))
+    app.state.upstream_client = _matrix_upstream()
+    with TestClient(app) as client:
+        resp = client.post("/music/api/v1/event/report", json={
+            "events": [{"eventType": "track_play", "payload": {"trackGUID": DISCOVER_GUID}}]})
+        assert resp.status_code == 200
+
+    stored = [it for it in dailyrec.load_online_play_history("user-a")
+              if it.get("guid") == DISCOVER_GUID]
+    assert stored, "track_play 未写入在线历史"
+    assert stored[-1]["track"]["title"] == "夜曲"
+    assert stored[-1]["track"]["artist"] == "周杰伦"
+    assert stored[-1]["track"]["album"] == "十一月的萧邦"
+
+
+def test_play_history_write_strips_upstream_placeholder(registry, env):
+    """客户端上报的就是占位显示名时也绝不入库（存空值，等列表期自愈）。"""
+    from proxy import recommend as dailyrec
+
+    guid = MIGU_GUID
+    app.state.upstream_client = _matrix_upstream()
+    with TestClient(app) as client:
+        resp = client.post("/music/api/v1/event/report", json={
+            "events": [{"eventType": "track_play", "payload": {
+                "trackGUID": guid, "title": "未知曲目", "artist": "未知歌手"}}]})
+        assert resp.status_code == 200
+
+    stored = [it for it in dailyrec.load_online_play_history("user-a") if it.get("guid") == guid]
+    assert stored, "track_play 未写入在线历史"
+    assert "未知" not in json.dumps(stored[-1], ensure_ascii=False)
+
+
+def test_metadata_sink_matrix_never_leaks_placeholder(registry, env, monkeypatch):
+    """出口矩阵：脏快照 + 上游只给占位值时，**每一个**出口都必须给出真名。
+
+    覆盖 收藏列表 / 最近播放列表 / 官方歌单附加条目 / 播放详情。
+    """
+    from proxy import recommend as dailyrec
+
+    registry.record(dict(DISCOVER_META))
+    registry.record(dict(MIGU_META))
+    dirty = _placeholder_snapshot(DISCOVER_GUID)
+    appmod.save_online_favorites("user-a", [
+        {"guid": DISCOVER_GUID, "createdAt": 1, "track": dirty}])
+    appmod.save_playlist_tracks("user-a", {
+        OFFICIAL_PLAYLIST: [{"guid": DISCOVER_GUID, "addedAt": 1, "track": dict(dirty)}]})
+    dailyrec.record_online_play("user-a", DISCOVER_GUID, dict(dirty))
+
+    async def fake_fetch(request, guid, include_lyric=True):
+        # 上游（lxserver 未命中缓存）只会合成占位常量
+        return dict(UPSTREAM_PLACEHOLDER)
+
+    monkeypatch.setattr(appmod, "_fetch_online_info", fake_fetch)
+    app.state.upstream_client = _matrix_upstream()
+
+    sinks: dict[str, object] = {}
+    with TestClient(app) as client:
+        sinks["favorite-track/list"] = client.get("/music/api/v1/favorite-track/list").json()
+        sinks["play-history/list"] = client.get("/music/api/v1/play-history/list").json()
+        sinks["track/playlist-detail/list"] = client.get(
+            "/music/api/v1/track/playlist-detail/list",
+            params={"playlistGUID": OFFICIAL_PLAYLIST, "page": 1, "size": 50},
+        ).json()
+        sinks["track/metadata"] = client.get(
+            "/music/api/v1/track/metadata", params={"guid": MIGU_GUID}).json()
+
+    leaked = [name for name, payload in sinks.items()
+              if "未知" in json.dumps(payload, ensure_ascii=False)]
+    assert not leaked, f"这些出口仍在泄露占位值/兜底文案：{leaked}"
+
+    # 不只是"没有占位值"，每个出口都要真的带出登记表里的真名
+    assert "夜曲" in json.dumps(sinks["favorite-track/list"], ensure_ascii=False)
+    assert "夜曲" in json.dumps(sinks["play-history/list"], ensure_ascii=False)
+    assert "夜曲" in json.dumps(sinks["track/playlist-detail/list"], ensure_ascii=False)
+    assert "稻香" in json.dumps(sinks["track/metadata"], ensure_ascii=False)
+
+def test_play_history_write_prefers_reported_title_over_registry(registry, env):
+    """客户端上报的（干净）显示名优先于登记表 —— 上报值就是"此刻播放的这一首"。
+
+    回归：登记表只能补**缺失/占位**字段，不能反过来覆盖上报里已有的真名。
+    """
+    from proxy import recommend as dailyrec
+
+    guid = MIGU_GUID
+    registry.record({"guid": guid, "title": "登记表名", "artist": "登记歌手"})
+    app.state.upstream_client = _matrix_upstream()
+    with TestClient(app) as client:
+        resp = client.post("/music/api/v1/event/report", json={
+            "events": [{"eventType": "track_play", "payload": {
+                "trackGUID": guid, "title": "[dl] 稻香", "artist": "周杰伦"}}]})
+        assert resp.status_code == 200
+
+    stored = [it for it in dailyrec.load_online_play_history("user-a") if it.get("guid") == guid]
+    assert stored, "track_play 未写入在线历史"
+    assert stored[-1]["track"]["title"] == "稻香"      # 来源标记已剥离
+    assert stored[-1]["track"]["artist"] == "周杰伦"

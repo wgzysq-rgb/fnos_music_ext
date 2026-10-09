@@ -1147,8 +1147,13 @@ install_sources_container() {
     export BUILDKIT_PROGRESS="${BUILDKIT_PROGRESS:-plain}"
     if ! run_docker compose -f "${BASE_DIR}/docker-compose.yml" up -d --build; then
         log_err "Docker 镜像构建或启动失败（compose up --build）。"
-        log_err "若日志里反复出现 apt/pip 拉取超时：多为国内网络直连境外源受限，"
-        log_err "可为 Docker 配置代理后重试，或检查 /var/log/apps/fnmusic-ext-install.log 定位具体步骤。"
+        log_err "构建期会依次尝试多个国内 apt/pip 镜像源；若仍失败，通常是构建容器整体无法外网访问。"
+        log_err "排查步骤（按序）："
+        log_err "  1) 查看完整日志: tail -n 200 /var/log/apps/fnmusic-ext-install.log"
+        log_err "  2) 采集只读诊断报告: sudo bash ${BASE_DIR}/scripts/diagnose_install.sh"
+        log_err "  3) 换源: 在 ${BASE_DIR}/.env 设置 FNMUSIC_PIP_INDEX / FNMUSIC_APT_MIRROR，"
+        log_err "     或自定义备用链 FNMUSIC_PIP_FALLBACK_INDEXES / FNMUSIC_APT_FALLBACK_MIRRORS"
+        log_err "  4) 给 Docker 配代理: /etc/docker/daemon.json 的 proxies 段，改完重启 Docker"
         return 1
     fi
     # entrypoint 只在容器启动时读一次 /repo/.env，而 compose 对镜像与配置均未变的

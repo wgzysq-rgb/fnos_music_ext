@@ -33,6 +33,10 @@ logger = logging.getLogger("fnmusic_proxy.recommend")
 
 DAILY_GUID_PREFIX = "online:playlist:daily:"
 HOT_GUID_PREFIX = "online:playlist:hot:"
+# 发现·歌单广场（platform_playlists）：每个平台推荐歌单一张虚拟歌单卡。
+# 形如 online:playlist:discover:<source>:<plid>，<plid> 为平台侧歌单 id
+# （酷我带 digest- 前缀原样保留，供详情解析分派）。
+DISCOVER_GUID_PREFIX = "online:playlist:discover:"
 # 酷我文本封面 host：该“封面 URL”实为含图片链接的文本页，不能当直链用（app.py 引用同一常量）
 KW_TEXT_COVER_HOST = "artistpicserver.kuwo.cn"
 DEFAULT_MODEL = "gpt-4o-mini"
@@ -174,13 +178,42 @@ def hot_playlist_guid(day: str | None = None, user_guid: str = "") -> str:
 
 
 def online_playlist_kind(guid: str | None) -> str:
-    """解析推荐歌单 guid 的类型：daily / hot，非推荐歌单返回空串。"""
+    """解析推荐歌单 guid 的类型：daily / hot / discover，非推荐歌单返回空串。"""
     s = str(guid or "")
     if s.startswith(DAILY_GUID_PREFIX):
         return "daily"
     if s.startswith(HOT_GUID_PREFIX):
         return "hot"
+    if s.startswith(DISCOVER_GUID_PREFIX):
+        return "discover"
     return ""
+
+
+def discover_playlist_guid(source: str, playlist_id: str) -> str:
+    """平台推荐歌单 → 虚拟歌单 guid。
+
+    source/playlist_id 做保守清洗：只允许 [A-Za-z0-9_-]，其余字符转下划线，
+    避免 guid 里出现会干扰下游解析的分隔符（酷我 digit-8__123 形态可原样保留）。
+    """
+    src = re.sub(r"[^A-Za-z0-9]", "", str(source or ""))[:8]
+    pid = re.sub(r"[^A-Za-z0-9_-]", "_", str(playlist_id or ""))[:80]
+    return f"{DISCOVER_GUID_PREFIX}{src}:{pid}"
+
+
+def parse_discover_playlist_guid(guid: str | None) -> tuple[str, str]:
+    """反解平台推荐歌单 guid → (source, playlist_id)；非该形态返回 ("", "")。"""
+    s = str(guid or "")
+    if not s.startswith(DISCOVER_GUID_PREFIX):
+        return "", ""
+    rest = s[len(DISCOVER_GUID_PREFIX):]
+    src, sep, pid = rest.partition(":")
+    if not sep or not src or not pid:
+        return "", ""
+    return src, pid
+
+
+def is_discover_playlist_guid(guid: str | None) -> bool:
+    return str(guid or "").startswith(DISCOVER_GUID_PREFIX)
 
 
 def is_recommend_playlist_guid(guid: str | None) -> bool:

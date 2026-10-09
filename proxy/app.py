@@ -37,6 +37,8 @@ from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Stre
 try:
     from . import recommend as dailyrec
     from . import nmplaylists as nmpl
+    from . import platform_playlists as plpl
+    from . import online_registry as onreg
     from . import transcode as tc
     from .cache_gc import purge_rolling, sweep_orphan_lyrics
     from .env_merge import parse_env_file
@@ -44,6 +46,8 @@ try:
 except ImportError:  # uvicorn --app-dir proxy
     import recommend as dailyrec  # type: ignore
     import nmplaylists as nmpl  # type: ignore
+    import platform_playlists as plpl  # type: ignore
+    import online_registry as onreg  # type: ignore
     import transcode as tc  # type: ignore
     from cache_gc import purge_rolling, sweep_orphan_lyrics  # type: ignore
     from env_merge import parse_env_file  # type: ignore
@@ -107,6 +111,14 @@ CONF = {
     # 空=从飞牛 shared_library.path 自动探测；测试可覆盖到临时目录
     "library_dir": os.environ.get("FNMUSIC_LIBRARY_DIR", ""),
     "cover_dir": os.environ.get("FNMUSIC_COVER_DIR", ""),
+    # 封面代理 + NAS 落盘缓存（2.7.7）：电脑浏览器对 http 封面直链做
+    # mixed-content 自动升级，CDN 不支持 https 时图片被静默丢弃（手机 App
+    # 不受 mixed-content 约束所以正常）。开启后 /static/cover 优先返回
+    # NAS 本地缓存的封面文件，未命中由代理代取并落盘，彻底失败才回落
+    # 302 直链。cover_cache_dir 空 = <cache_dir>/covers。
+    "cover_proxy": os.environ.get("FNMUSIC_COVER_PROXY", "true").lower() in ("true", "1", "yes"),
+    "cover_cache_dir": os.environ.get("FNMUSIC_COVER_CACHE_DIR", ""),
+    "cover_cache_max": int(os.environ.get("FNMUSIC_COVER_CACHE_MAX", "2000")),
     "music_db": os.environ.get(
         "FNMUSIC_MUSIC_DB", "/usr/local/apps/@appdata/trim.music/db/music.db"
     ),
@@ -174,6 +186,12 @@ CONF = {
     "quality_mode": (os.environ.get("FNMUSIC_QUALITY_MODE") or "high").strip().lower(),
     "recommend_hot": os.environ.get("FNMUSIC_RECOMMEND_HOT", "true").lower() in ("true", "1", "yes"),
     "recommend_daily": os.environ.get("FNMUSIC_RECOMMEND_DAILY", "true").lower() in ("true", "1", "yes"),
+    # 发现·歌单广场（2.8.0）：把各平台推荐歌单注入音乐页歌单列表，默认关。
+    # platform_playlist 开关本体；recommend_playlist_source 指定平台（csv，
+    # 空=全部平台）；recommend_playlist_page_size 每平台注入多少张歌单卡。
+    "recommend_playlist": os.environ.get("FNMUSIC_RECOMMEND_PLAYLIST", "false").lower() in ("true", "1", "yes"),
+    "recommend_playlist_source": (os.environ.get("FNMUSIC_RECOMMEND_PLAYLIST_SOURCE") or "").strip().lower(),
+    "recommend_playlist_page_size": max(1, min(30, int(os.environ.get("FNMUSIC_RECOMMEND_PLAYLIST_PAGE_SIZE", "12") or 12))),
     # 网易账号歌单注入（2.6.0）：默认关；需网易盒子启用并扫码登录，
     # 音乐页在热门推荐与官方歌单之间展示账号自建歌单（只读，不回写网易）
     "netease_my_playlists": os.environ.get("FNMUSIC_NETEASE_MY_PLAYLISTS", "false").lower() in ("true", "1", "yes"),
@@ -498,8 +516,14 @@ _ENV_WATCH_KEYS: dict[str, tuple[str, str]] = {
     "FNMUSIC_LIBRARY_SCAN_PATH": ("library_scan_path", "str"),
     "FNMUSIC_RECOMMEND_HOT": ("recommend_hot", "bool"),
     "FNMUSIC_RECOMMEND_DAILY": ("recommend_daily", "bool"),
+    "FNMUSIC_RECOMMEND_PLAYLIST": ("recommend_playlist", "bool"),
+    "FNMUSIC_RECOMMEND_PLAYLIST_SOURCE": ("recommend_playlist_source", "str"),
+    "FNMUSIC_RECOMMEND_PLAYLIST_PAGE_SIZE": ("recommend_playlist_page_size", "pl_page_size"),
     "FNMUSIC_NETEASE_MY_PLAYLISTS": ("netease_my_playlists", "bool"),
     "FNMUSIC_COVER_DIR": ("cover_dir", "str"),
+    "FNMUSIC_COVER_PROXY": ("cover_proxy", "bool"),
+    "FNMUSIC_COVER_CACHE_DIR": ("cover_cache_dir", "str"),
+    "FNMUSIC_COVER_CACHE_MAX": ("cover_cache_max", "cover_cache_max"),
     "FNMUSIC_COVER_ENRICH": ("cover_enrich", "bool"),
     "FNMUSIC_TRACE_FORWARD": ("trace_forward", "bool"),
     "FNMUSIC_TRANSCODE_ENABLED": ("transcode_enabled", "bool"),
@@ -567,6 +591,11 @@ def _env_watch_parse(raw: str, kind: str):
             return max(1, min(102400, int(raw)))
         except (TypeError, ValueError):
             return None
+    if kind == "cover_cache_max":
+        try:
+            return max(10, min(20000, int(raw)))
+        except (TypeError, ValueError):
+            return None
     if kind == "tee_handoff_max":
         try:
             return max(0, min(20, int(raw)))
@@ -575,6 +604,11 @@ def _env_watch_parse(raw: str, kind: str):
     if kind == "deep_pages":
         try:
             return max(1, min(50, int(raw)))
+        except (TypeError, ValueError):
+            return None
+    if kind == "pl_page_size":
+        try:
+            return max(1, min(30, int(raw)))
         except (TypeError, ValueError):
             return None
     return raw
@@ -1276,6 +1310,115 @@ def download_cover_bytes(url: str) -> "tuple[bytes, str] | None":
         return None
 
 
+# === 封面代理 + NAS 落盘缓存（2.7.7） ===
+# 手机 App 直接加载 http 封面直链没问题；电脑浏览器（Chrome 86+）会对 http
+# 图片做 mixed-content 自动升级，CDN 不支持 https 时图片被静默丢弃——这就是
+# 「App 封面正常、网页封面经常加载不出来」的根因。把封面统一代理成 NAS 本地
+# 文件响应即可彻底规避，顺带落盘缓存减轻源站 CDN 压力（用户之前提过的
+# 「封面缓存到 NAS」诉求一并落地）。
+_COVER_CACHE_MIME_EXT = {
+    "image/jpeg": "jpg",
+    "image/png": "png",
+    "image/webp": "webp",
+    "image/gif": "gif",
+}
+
+
+def _cover_cache_dir() -> str:
+    """封面缓存目录（显式配置或 <cache_dir>/covers）；不可用时返回空串。"""
+    explicit = str(CONF.get("cover_cache_dir") or "").strip()
+    d = explicit or os.path.join(CONF["cache_dir"], "covers")
+    try:
+        os.makedirs(d, exist_ok=True)
+        return d if os.access(d, os.W_OK) else ""
+    except Exception as e:
+        logger.warning("cover cache dir %s unusable: %s; cover proxy falls back to 302", d, e)
+        return ""
+
+
+def _cover_cache_key(url: str) -> str:
+    return hashlib.sha256(url.encode("utf-8")).hexdigest()[:32]
+
+
+def _cover_cache_lookup(url: str) -> str:
+    d = _cover_cache_dir()
+    if not d:
+        return ""
+    key = _cover_cache_key(url)
+    for ext in _COVER_CACHE_MIME_EXT.values():
+        p = os.path.join(d, f"{key}.{ext}")
+        if os.path.isfile(p):
+            return p
+    return ""
+
+
+def _cover_cache_evict() -> None:
+    """数量超上限时按最旧 mtime 淘汰，防止封面缓存无限增长。"""
+    d = _cover_cache_dir()
+    if not d:
+        return
+    try:
+        max_n = max(10, int(CONF.get("cover_cache_max") or 2000))
+        entries: list[tuple[float, str]] = []
+        for name in os.listdir(d):
+            p = os.path.join(d, name)
+            if os.path.isfile(p):
+                entries.append((os.path.getmtime(p), p))
+        if len(entries) <= max_n:
+            return
+        entries.sort()
+        for _, p in entries[: len(entries) - max_n]:
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+    except Exception as e:
+        logger.debug("cover cache evict failed: %s", e)
+
+
+def _cover_cache_store(url: str, data: bytes, mime: str) -> str:
+    """原子落盘封面字节，返回缓存文件路径；失败返回空串。"""
+    d = _cover_cache_dir()
+    if not d or not data:
+        return ""
+    ext = _COVER_CACHE_MIME_EXT.get(mime, "jpg")
+    path = os.path.join(d, f"{_cover_cache_key(url)}.{ext}")
+    tmp = f"{path}.{os.getpid()}.{int(time.time() * 1000)}.tmp"
+    try:
+        with open(tmp, "wb") as f:
+            f.write(data)
+        os.replace(tmp, path)
+    except Exception as e:
+        logger.debug("cover cache store failed for %s: %s", url, e)
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        return ""
+    _cover_cache_evict()
+    return path
+
+
+async def _cover_proxy_response(url: str) -> "Response | None":
+    """封面代理：命中/代取成功返回本地文件响应，否则 None（调用方回落 302）。"""
+    url = str(url or "").strip()
+    if not CONF.get("cover_proxy") or not url.startswith(("http://", "https://")):
+        return None
+    if _KW_TEXT_COVER_HOST in url:
+        return None
+    hit = _cover_cache_lookup(url)
+    if hit:
+        return FileResponse(hit, headers={"Cache-Control": "public, max-age=86400"})
+    fetched = await asyncio.to_thread(download_cover_bytes, url)
+    if fetched is None:
+        return None
+    data, mime = fetched
+    path = _cover_cache_store(url, data, mime)
+    if not path:
+        return None
+    return FileResponse(path, media_type=mime, headers={"Cache-Control": "public, max-age=86400"})
+
+
 def _has_embedded_cover(path: str) -> bool:
     try:
         from mutagen import File as MutagenFile
@@ -1357,6 +1500,9 @@ def embed_audio_cover(path: str, data: bytes, mime: str) -> bool:
         return False
 
 
+_LIBRARY_FALLBACK_WARNED = False
+
+
 def detect_library_dir() -> str:
     """优先环境变量，否则读飞牛 music.db 的共享库路径，最后回退到仓库 cache/。"""
     explicit = str(CONF.get("library_dir") or "").strip()
@@ -1373,8 +1519,31 @@ def detect_library_dir() -> str:
             for (path,) in rows:
                 if path and os.path.isdir(path):
                     return path
+            if rows:
+                logger.warning(
+                    "shared_library 里有 %d 条路径但均不存在/不可访问：%s",
+                    len(rows), [r[0] for r in rows],
+                )
         except Exception as e:
             logger.warning("Failed to read shared_library path: %s", e)
+    # 回落 cache/ 是用户最难自查的静默降级：文件仍然落盘，但文件名是
+    # 哈希、不在官方曲库里，看起来就像「边听边存失效」。必须显著留痕。
+    global _LIBRARY_FALLBACK_WARNED
+    if not _LIBRARY_FALLBACK_WARNED:
+        _LIBRARY_FALLBACK_WARNED = True
+        if db and not os.path.exists(db):
+            logger.warning(
+                "曲库探测失败：music.db 不存在（%s）。边听边存将落到 cache 目录（%s），"
+                "文件不进官方曲库！若 fnOS 升级/曲库迁移过，请在 .env 设置 "
+                "FNMUSIC_MUSIC_DB 或 FNMUSIC_LIBRARY_DIR 指向真实曲库。",
+                db, CONF["cache_dir"],
+            )
+        else:
+            logger.warning(
+                "曲库探测失败：shared_library 无可用路径。边听边存将落到 cache 目录（%s），"
+                "文件不进官方曲库！请在 .env 设置 FNMUSIC_LIBRARY_DIR 指向真实曲库。",
+                CONF["cache_dir"],
+            )
     return CONF["cache_dir"]
 
 
@@ -1816,6 +1985,15 @@ def get_lx_client(fastapi_app: FastAPI) -> httpx.AsyncClient:
     return client
 
 
+def get_platform_client(fastapi_app: FastAPI) -> httpx.AsyncClient:
+    """平台推荐歌单抓取用直连客户端（第三方域名，无 base_url）。"""
+    client = getattr(fastapi_app.state, "platform_client", None)
+    if client is None:
+        client = httpx.AsyncClient(timeout=httpx.Timeout(15.0, connect=6.0), follow_redirects=True)
+        fastapi_app.state.platform_client = client
+    return client
+
+
 def get_llm_client(fastapi_app: FastAPI) -> httpx.AsyncClient:
     client = getattr(fastapi_app.state, "llm_client", None)
     if client is None:
@@ -2187,6 +2365,7 @@ async def resolve_lx_url(client: httpx.AsyncClient, song_id: str) -> "dict | Non
     if primary and primary not in qualities:
         qualities.insert(0, primary)
 
+    last_status: "int | str" = "none"
     for q in qualities:
         try:
             r = await client.get(
@@ -2202,8 +2381,18 @@ async def resolve_lx_url(client: httpx.AsyncClient, song_id: str) -> "dict | Non
                     inner = data.get("data")
                     if isinstance(inner, dict) and inner.get("url"):
                         return inner
+            last_status = r.status_code
         except Exception as e:
+            last_status = type(e).__name__
             logger.warning("resolve_lx_url error for %s (quality=%s): %s", song_id, q, e)
+    # 全档降级都没拿到直链：这里必须留痕。此前静默返回 None，App 侧表现为
+    # 「能显示曲目但一播就跳下一首」，而服务端日志里没有任何线索。
+    # 最常见原因：洛雪源自定义源未激活 / 源脚本报错 / 该曲目被版权限制。
+    logger.warning(
+        "resolve_lx_url 全档失败 %s（音质链 %s，最后状态 %s）："
+        "请检查洛雪源是否已激活、源脚本是否可用",
+        song_id, ",".join(qualities), last_status,
+    )
     return None
 
 
@@ -2387,6 +2576,38 @@ def _tag_fields(info: dict | None) -> tuple[str, str, str]:
 def _cover_url_of(info: dict | None) -> str:
     src = info if isinstance(info, dict) else {}
     return str(src.get("cover_url") or src.get("coverUrl") or src.get("coverURL") or "").strip()
+
+
+def _registry_apply(guid: str, data: dict | None) -> dict:
+    """在线登记表回填的**统一出口**：占位/缺失字段用登记值替换，绝不覆盖真实值。
+
+    `_online_info()`（播放详情）与落盘链路（曲库定名/写标签、下载产物打标签）必须
+    走同一张表、同一套语义。只修播放详情会出现"播放界面正常、落库与下载仍是
+    未知曲目/未知歌手"的分裂现象——上游对未命中缓存的曲目只会合成占位常量。
+    恒返回新 dict（不改调用方对象）；无登记或无 data 时返回空 dict/原样副本。
+    """
+    try:
+        merged = onreg.REGISTRY.apply(guid, data)
+    except Exception:  # noqa: BLE001
+        merged = data
+    return dict(merged) if isinstance(merged, dict) else {}
+
+
+def _has_real_title(data: dict | None) -> bool:
+    """标题可用（非空且不是上游占位值）——决定元数据是否还需要继续回查。
+
+    只判 `_tag_fields()[0]` 非空是不够的：上游对未命中缓存的曲目会给「未知曲目」
+    这类占位常量，把占位值当有效值用会一路写进曲库文件名与文件标签。
+    """
+    if not isinstance(data, dict):
+        return False
+    title = _tag_fields(data)[0]
+    return bool(title) and not onreg.is_placeholder(title)
+
+
+def _is_real_tag(value: Any) -> bool:
+    """单个展示字段是否可用（非空且不是占位值）。"""
+    return bool(str(value or "").strip()) and not onreg.is_placeholder(value)
 
 
 def _item_meta_richness(it: dict) -> int:
@@ -2928,6 +3149,10 @@ async def lifespan(fastapi_app: FastAPI):
         if created_llm and getattr(fastapi_app.state, "llm_client", None):
             await fastapi_app.state.llm_client.aclose()
             fastapi_app.state.llm_client = None
+        if getattr(fastapi_app.state, "platform_client", None):
+            # 平台推荐歌单抓取客户端：惰性创建，无 created_* 标记，存在即回收
+            await fastapi_app.state.platform_client.aclose()
+            fastapi_app.state.platform_client = None
 
 
 app = FastAPI(title="fnmusic-ext", lifespan=lifespan)
@@ -3443,11 +3668,11 @@ async def search_suggest(request: Request):
     return JSONResponse(content=upstream_json, status_code=upstream_resp.status_code, headers=resp_headers)
 
 
-def _lookup_online_snapshot(guid: str) -> "dict | None":
-    """按 guid 在在线播放历史/在线收藏的用户快照里反查曲目元数据（issue #28）。
+def _iter_stored_snapshots(guid: str):
+    """按 guid 遍历三个本地存储里的落盘快照（优先级：历史 → 收藏 → 歌单附加条目）。
 
-    两个存储都按用户分文件且量小（历史 ≤500 条/用户），tee 转正是低频路径，
-    顺序扫描可接受；命中即返回含 title/artist/album 的快照 dict。
+    快照是「曲目最终 VO」形态（artists 数组、album 对象），调用方一律用 `_tag_fields`
+    取标签，不能 str(album)。
     """
     # ① 在线播放历史（play_history/<user>.json，条目最新的在末尾，倒序找）
     try:
@@ -3466,8 +3691,8 @@ def _lookup_online_snapshot(guid: str) -> "dict | None":
             for it in reversed(items):
                 if isinstance(it, dict) and it.get("guid") == guid:
                     snap = it.get("track") if isinstance(it.get("track"), dict) else None
-                    if snap and (snap.get("title") or snap.get("artist")):
-                        return snap
+                    if snap:
+                        yield snap
     except OSError:
         pass
     # ② 在线收藏（online_favorites/<user>.json，形状同收藏下发条目）
@@ -3487,8 +3712,8 @@ def _lookup_online_snapshot(guid: str) -> "dict | None":
             for it in reversed(items):
                 if isinstance(it, dict) and it.get("guid") == guid:
                     snap = it.get("track") if isinstance(it.get("track"), dict) else None
-                    if snap and (snap.get("title") or snap.get("artist")):
-                        return snap
+                    if snap:
+                        yield snap
     except OSError:
         pass
     # ③ 歌单附加条目（playlist_tracks/<user>.json，{"items": {歌单guid: [条目]}}）：
@@ -3512,11 +3737,28 @@ def _lookup_online_snapshot(guid: str) -> "dict | None":
                 for it in reversed(bucket):
                     if isinstance(it, dict) and it.get("guid") == guid:
                         snap = it.get("track") if isinstance(it.get("track"), dict) else None
-                        if snap and (snap.get("title") or snap.get("artist")):
-                            return snap
+                        if snap:
+                            yield snap
     except OSError:
         pass
-    return None
+
+
+def _lookup_online_snapshot(guid: str) -> "dict | None":
+    """按 guid 在落盘快照里反查曲目元数据（issue #28）。
+
+    三个存储都按用户分文件且量小（历史 ≤500 条/用户），tee 转正是低频路径，
+    顺序扫描可接受。**优先返回带真实标题/歌手的快照**：历史里可能残留上游占位值
+    （"未知曲目/未知歌手"）的旧快照，不能让它挡住后面存储里的真名（真名决定曲库
+    文件名与文件标签）；都没有真名时回落到第一个带内容的快照（至少能贡献封面）。
+    """
+    fallback: "dict | None" = None
+    for snap in _iter_stored_snapshots(guid):
+        title, artist, _album = _tag_fields(snap)
+        if _is_real_tag(title) or _is_real_tag(artist):
+            return snap
+        if fallback is None:
+            fallback = snap
+    return fallback
 
 
 def _track_in_list(tracks: Any, guid: str) -> dict | None:
@@ -3555,24 +3797,80 @@ def _lookup_playlist_cache_track(guid: str) -> dict | None:
 
 
 def _merge_missing_tags(title: str, artist: str, album: str, snap: dict) -> tuple[str, str, str]:
-    """只补空字段。已经是纯字符串的专辑不被缓存里的另一份专辑覆盖。"""
+    """只补空字段与上游占位字段。已经是纯字符串的专辑不被缓存里的另一份专辑覆盖。
+
+    「未知曲目/未知歌手」这类占位常量按**缺失**处理：只判空串的话，上游占位值
+    会挡住回查到的真名，文件就以占位值定名并写进标签。
+    """
     snap_title, snap_artist, snap_album = _tag_fields(snap)
-    return title or snap_title, artist or snap_artist, album or snap_album
+
+    def pick(current: str, candidate: str) -> str:
+        if _is_real_tag(current):
+            return current
+        return candidate if _is_real_tag(candidate) else current
+
+    return (
+        pick(title, snap_title),
+        pick(artist, snap_artist),
+        pick(album, snap_album),
+    )
+
+
+def _heal_stored_meta(guid: str, info: dict | None) -> dict:
+    """落盘快照（收藏 / 播放历史 / 歌单附加条目）展示元数据的**自愈出口**。
+
+    列表接口（最近播放、收藏、官方歌单附加条目）读的是历史快照；旧快照里可能存着
+    上游占位值（"未知曲目/未知歌手"）或空字段——它们是在登记表接入之前写入的。
+    这里按「占位即缺失」两级回查：
+
+    ① 在线登记表（推荐/平台推荐/网易账号歌单下发曲目时登记，跨重启持久化）；
+    ② 推荐歌单、网易账号歌单的磁盘缓存（`_lookup_playlist_cache_track`）。
+
+    两级都查不到时保持原样，绝不臆造。恒返回新 dict。
+    """
+    out = _registry_apply(guid, info)
+    title, artist, album = _tag_fields(out)
+    if _is_real_tag(title) and _is_real_tag(artist):
+        return out
+    snap = _lookup_playlist_cache_track(guid)
+    if not snap:
+        return out
+    title, artist, album = _merge_missing_tags(title, artist, album, snap)
+    out = dict(out)
+    if title:
+        out["title"] = title
+    if artist:
+        out["artist"] = artist
+    if album:
+        out["album"] = album
+    if not _cover_url_of(out):
+        cover = _cover_url_of(snap)
+        if cover:
+            out["cover_url"] = cover
+    return out
 
 
 def _tee_metadata_fallback(
     guid: str, title: str, artist: str, album: str, dest_info: dict | None = None,
 ) -> tuple[str, str, str]:
-    """tee 落盘元数据缺失时的回查兜底，避免以 unknown 进曲库。
+    """落盘元数据缺失/命中上游占位值时的回查兜底，避免以 unknown 进曲库。
 
-    顺序：推荐/网易账号歌单缓存（首播时历史往往还没写）→ 播放历史/收藏/自建歌单。
-    缺哪个字段补哪个；已有的纯字符串专辑保持不变。封面 URL 只在调用方还没有时写入 dest_info。
+    顺序：在线登记表（推荐歌单/平台推荐歌单下发时登记，与播放详情同一张表）
+    → 推荐/网易账号歌单磁盘缓存 → 播放历史/收藏/自建歌单。
+    缺哪个字段补哪个；上游占位值（"未知曲目/未知歌手"）按缺失处理，已有的真实值
+    保持不变。封面 URL 只在调用方还没有时写入 dest_info。
     """
     title, artist, album = (title or "").strip(), (artist or "").strip(), (album or "").strip()
+
+    def complete() -> bool:
+        return _is_real_tag(title) and _is_real_tag(artist) and _is_real_tag(album)
+
     need_cover = not _cover_url_of(dest_info)
-    if not (title and artist and album and not need_cover):
+    if not (complete() and not need_cover):
         filled = False
-        for snap in (_lookup_playlist_cache_track(guid), _lookup_online_snapshot(guid)):
+        for snap in (_registry_apply(guid, None),
+                     _lookup_playlist_cache_track(guid),
+                     _lookup_online_snapshot(guid)):
             if not snap:
                 continue
             title, artist, album = _merge_missing_tags(title, artist, album, snap)
@@ -3582,13 +3880,13 @@ def _tee_metadata_fallback(
                     dest_info["cover_url"] = cover
                     need_cover = False
             filled = True
-            if title and artist and album and not need_cover:
+            if complete() and not need_cover:
                 break
         if filled:
             logger.info("tee metadata fallback hit for %s: %s - %s", guid, artist, title)
-    if not (title and artist):
+    if not (_is_real_tag(title) and _is_real_tag(artist)):
         logger.warning(
-            "tee finalize missing metadata for %s (title=%r artist=%r)：将以 unknown 命名落盘，"
+            "在线曲目元数据缺失 for %s (title=%r artist=%r)：落盘将退化为 unknown/未知，"
             "该曲目的元数据解析链路需要排查", guid, title, artist,
         )
     return title, artist, album
@@ -4106,12 +4404,17 @@ async def _info_for_background_save(request: Request, guid: str, info: dict | No
 
     本地推荐歌单、网易账号歌单、历史/收藏里已有标题就用那份，不再打源站。
     都没有时再拉一次歌曲信息（数秒，不占播放起播的 0.75 秒窗口）。
+
+    四处来源**都要过 `_registry_apply()`**（与播放详情同一张在线登记表），且
+    "有标题"的判定要用 `_has_real_title()` 排除上游占位值——否则 lxserver 合成的
+    「未知曲目/未知歌手」会被当成有效元数据，一路写进曲库文件名与文件标签，
+    表现为"播放界面歌名正常，下载/边听边存到本地仍是未知歌手 - 未知曲目"。
     """
-    base = dict(info or {})
-    if _tag_fields(base)[0]:
+    base = _registry_apply(guid, info)
+    if _has_real_title(base):
         return base
-    local = _lookup_playlist_cache_track(guid) or _lookup_online_snapshot(guid)
-    if local and _tag_fields(local)[0]:
+    local = _registry_apply(guid, _lookup_playlist_cache_track(guid) or _lookup_online_snapshot(guid))
+    if _has_real_title(local):
         merged = dict(local)
         if base.get("ext"):
             merged["ext"] = base["ext"]
@@ -4123,7 +4426,8 @@ async def _info_for_background_save(request: Request, guid: str, info: dict | No
     except Exception as exc:
         logger.info("background online info missed for %s: %s", guid, type(exc).__name__)
         return base
-    if isinstance(fetched, dict) and _tag_fields(fetched)[0]:
+    fetched = _registry_apply(guid, fetched)
+    if _has_real_title(fetched):
         if base.get("ext") and not fetched.get("ext"):
             fetched = dict(fetched)
             fetched["ext"] = base["ext"]
@@ -4997,6 +5301,12 @@ async def stream_track(request: Request, subpath: str = ""):
                 break
             if not await _recover_source(request, candidate, entry):
                 break
+    # 必须留痕：App 拿到这个 404 就会直接跳下一首，而此前服务端一行日志都没有，
+    # 导致「能显示曲目但一播就跳」在日志里完全不可见。
+    logger.warning(
+        "stream 取流失败 %s：候选 %s 全部不可用（App 会跳过该曲目）",
+        guid, list(dict.fromkeys(candidates))[:3],
+    )
     return JSONResponse(content={"code": 404, "msg": "online source unavailable", "data": None}, status_code=404)
 
 
@@ -5210,8 +5520,126 @@ def _dl_state_word(task: dict) -> str:
     return {"completed": "ready"}.get(state, state)
 
 
+def _read_audio_tags(path: str) -> tuple[str, str, str]:
+    """读音频文件里已写入的 title/artist/album（mutagen easy 模式，取首值）。
+
+    读不出来（格式不支持/无标签/文件被替换成测试桩）返回三个空串，调用方据此
+    走回查兜底——绝不因为读失败就中断下载。
+    """
+    try:
+        from mutagen import File as MutagenFile
+
+        audio = MutagenFile(path, easy=True)
+    except Exception:  # noqa: BLE001
+        return "", "", ""
+    if audio is None:
+        return "", "", ""
+
+    def first(key: str) -> str:
+        value = audio.get(key)
+        if isinstance(value, (list, tuple)):
+            return str(value[0]).strip() if value else ""
+        return str(value or "").strip()
+
+    return first("title"), first("artist"), first("album")
+
+
+def _resolve_download_tags(guid: str, src: str) -> tuple[str, str, str]:
+    """下载产物要写的元数据：源文件已有真实标签优先，缺失/占位时走回查兜底。"""
+    title, artist, album = _read_audio_tags(src)
+    if _is_real_tag(title) and _is_real_tag(artist) and _is_real_tag(album):
+        return title, artist, album
+    return _tee_metadata_fallback(guid, title, artist, album)
+
+
+def _stem_looks_placeholder(path: str) -> bool:
+    """文件名（不含扩展名）是否为占位式（"未知歌手 - 未知曲目"）；guid 哈希名不算。"""
+    stem = os.path.splitext(os.path.basename(path or ""))[0]
+    return onreg.is_placeholder_name(stem)
+
+
+def _move_sibling_lyric(old_path: str, new_path: str) -> None:
+    """曲库音频改名时同步搬走同名 .lrc（歌词与音频同词干放置）。"""
+    old_lrc = os.path.splitext(old_path)[0] + ".lrc"
+    if not os.path.isfile(old_lrc):
+        return
+    try:
+        os.replace(old_lrc, os.path.splitext(new_path)[0] + ".lrc")
+    except OSError:
+        pass
+
+
+def _dl_tagged_media(guid: str, src: str) -> tuple[str, bool]:
+    """返回供 App 下载的文件路径，保证其内嵌标签是**真实**元数据。
+
+    修复"下载到本地仍显示未知歌手 - 未知曲目"：≤2.7.4 落库/落缓存时吃的是上游
+    占位值（见 `_info_for_background_save`），磁盘上的文件名与标签都是占位式，
+    下载只会把占位值原样搬到 App 本地。这里在下载路径上就地自愈一次：
+
+    - 曲库文件：补写真实标签；文件名仍是占位式时同步改名（含同名 .lrc）；
+    - 滚动缓存文件（cache 目录、guid 哈希命名）可能正被播放读取，**不原地改写**，
+      另存一份带标签的副本到下载暂存目录供下载；
+    - 解析不出真实元数据时原样返回，绝不制造"未知"半成品。
+
+    返回 (路径, 是否改动了磁盘)。
+    """
+    cur_title, cur_artist, _cur_album = _read_audio_tags(src)
+    if (_is_real_tag(cur_title) and _is_real_tag(cur_artist)
+            and not _stem_looks_placeholder(src)):
+        return src, False
+    title, artist, album = _resolve_download_tags(guid, src)
+    if not (_is_real_tag(title) and _is_real_tag(artist)):
+        return src, False
+    if _is_rolling_cache_stem(src, guid):
+        ext = os.path.splitext(src)[1].lstrip(".") or "mp3"
+        target = os.path.join(CONF["cache_dir"], _DL_TRANSCODE_SUBDIR,
+                              f"{cache_safe_guid(guid)}.tagged.{ext}")
+        try:
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            shutil.copyfile(src, target)
+        except OSError as e:
+            logger.warning("download tagged copy failed for %s: %s", guid, e)
+            return src, False
+        write_audio_tags(target, title, artist, album)
+        logger.info("download served tagged copy for %s: %s", guid, target)
+        return target, True
+    dest = src
+    new_stem = library_basename(title, artist)
+    if new_stem and new_stem != os.path.splitext(os.path.basename(src))[0]:
+        ext = os.path.splitext(src)[1].lstrip(".") or "mp3"
+        candidate = unique_library_path(os.path.dirname(src), new_stem, ext)
+        try:
+            os.replace(src, candidate)
+        except OSError as e:
+            logger.warning("download rename failed for %s: %s", guid, e)
+        else:
+            _move_sibling_lyric(src, candidate)
+            remember_media_path(guid, candidate)
+            adopt_library_perms(candidate)
+            dest = candidate
+            logger.info("download healed library naming for %s: %s", guid, candidate)
+    write_audio_tags(dest, title, artist, album)
+    return dest, True
+
+
+async def _dl_tag_transcoded(guid: str, src: str, target: str) -> None:
+    """给标准档转码产物补写真实标签。
+
+    转码命令用 `-map_metadata -1` 主动清空了输入标签（上游流里的标签本身可能
+    就是占位值），不补写的话 App 存到本地的那份文件没有标签，只能退化成
+    「未知歌手 - 未知曲目」。取值走 `_resolve_download_tags()`（源文件标签 →
+    在线登记表/歌单缓存/历史收藏回查）。
+    """
+    title, artist, album = await asyncio.to_thread(_resolve_download_tags, guid, src)
+    await asyncio.to_thread(write_audio_tags, target, title, artist, album)
+
+
 async def _dl_produce(task: dict, cred_headers: dict) -> None:
-    """后台产文件：标准档按官方规格 MP3 320k（源已是 mp3 直接供原文件）；原始档供原文件。"""
+    """后台产文件：标准档按官方规格 MP3 320k（源已是 mp3 直接供原文件）；原始档供原文件。
+
+    落盘源先过 `_dl_tagged_media()` 元数据自愈（本地副本必须带真实标签），
+    转码产物的标签由本函数在转码后补写。
+    """
     guid = task["guid"]
     try:
         src = find_cache_file(guid)
@@ -5223,6 +5651,11 @@ async def _dl_produce(task: dict, cred_headers: dict) -> None:
             task["state"] = "failed"
             task["errmsg"] = "online source unavailable"
             return
+        src, healed = await asyncio.to_thread(_dl_tagged_media, guid, src)
+        if healed:
+            # 曲库改名/补标签后通知官方重扫（路径可配置、默认禁用，带节流）
+            _schedule_library_scan(cred_headers)
+        title, artist, album = await asyncio.to_thread(_resolve_download_tags, guid, src)
         if task.get("quality") == "original" or os.path.splitext(src)[1].lower() == ".mp3":
             task["path"] = src
         else:
@@ -5242,7 +5675,13 @@ async def _dl_produce(task: dict, cred_headers: dict) -> None:
                     task["state"] = "failed"
                     task["errmsg"] = "transcode failed"
                     return
+                await _dl_tag_transcoded(guid, src, target)
             task["path"] = target
+        if _is_real_tag(title) and _is_real_tag(artist):
+            # 下载文件名给真实元数据：App 把文件存到本地后显示的就是这个名字
+            # （Content-Disposition）。解析不出真实值才回落到磁盘名。
+            ext = os.path.splitext(task["path"])[1] or ".mp3"
+            task["filename"] = f"{library_basename(title, artist)}{ext}"
         task["state"] = "completed"
         task["percent"] = 100
         try:
@@ -5335,7 +5774,9 @@ async def dl_transcode_file(request: Request):
     if task["state"] != "completed" or not path or not os.path.isfile(path):
         return JSONResponse(content={"code": 404, "msg": "not ready", "data": None}, status_code=404)
     media = "audio/mpeg" if os.path.splitext(path)[1].lower() == ".mp3" else "audio/mp4"
-    fname = os.path.basename(path)
+    # 优先用产出阶段解析出的真实元数据文件名（"歌手 - 歌名.ext"）：App 把它存到
+    # 本地后显示的就是这个名字，用磁盘名会泄露 guid 哈希或占位式旧名。
+    fname = str(task.get("filename") or "") or os.path.basename(path)
     fn_ext = os.path.splitext(fname)[1]
     quoted = quote(fname, encoding="utf-8")
     ascii_fn = re.sub(r'[^\x20-\x7e]', '_', fname)
@@ -5364,20 +5805,23 @@ async def dl_transcode_delete(request: Request):
 
 
 async def _online_info(request: Request, guid: str, include_lyric: bool = True) -> dict | None:
+    # 登记表回填：推荐歌单/网易歌单等在 _SEARCH_CACHE 之外下发的曲目，其元数据
+    # 由 onreg 在列表下发时登记。上游（尤其 lxserver 未命中缓存时）只会返回
+    # "未知曲目/未知歌手" 占位值，这里用登记值替换占位值（不覆盖真实数据）。
     retained, entry = _retained_track(request, guid)
     if not _source_enabled(guid):
-        return retained
+        return onreg.REGISTRY.apply(guid, retained)
     try:
         data = await asyncio.wait_for(_fetch_online_info(request, guid, include_lyric=include_lyric), timeout=4.0)
         if data:
-            return data
+            return onreg.REGISTRY.apply(guid, data)
         if await _recover_source(request, guid, entry):
             data = await asyncio.wait_for(_fetch_online_info(request, guid, include_lyric=include_lyric), timeout=3.0)
             if data:
-                return data
+                return onreg.REGISTRY.apply(guid, data)
     except Exception:
         pass
-    return retained
+    return onreg.REGISTRY.apply(guid, retained)
 
 
 async def _fetch_online_info(request: Request, guid: str, include_lyric: bool = True) -> dict | None:
@@ -5835,6 +6279,27 @@ async def static_cover(request: Request, subpath: str = ""):
         cand = subpath.strip("/").split("/")[-1]
         if cand:
             guid = resolve_real_guid(cand)
+    # 平台推荐歌单（discover）：卡片封面直链登记在 _DISCOVER_COVER_REVERSE，
+    # guid 或 coverId 反解出直链即 302；未登记的回落到歌单曲目首图。
+    # 必须排在 daily/hot 分支之前——discover 不按日构建，没有 daily 缓存。
+    if dailyrec.is_discover_playlist_guid(guid):
+        direct = _discover_cover_url(guid)
+        if direct:
+            proxied = await _cover_proxy_response(direct)
+            if proxied is not None:
+                return proxied
+            return RedirectResponse(direct, status_code=302)
+        source, pid = dailyrec.parse_discover_playlist_guid(guid)
+        if source and pid:
+            tracks = await _load_discover_tracks(source, pid)
+            picked = dailyrec.pick_playlist_cover_track(tracks)
+            cover = str((picked or {}).get("cover_url") or "")
+            if cover and _KW_TEXT_COVER_HOST not in cover:
+                proxied = await _cover_proxy_response(cover)
+                if proxied is not None:
+                    return proxied
+                return RedirectResponse(cover, status_code=302)
+        return _placeholder_cover_response(guid)
     playlist_kind = dailyrec.online_playlist_kind(guid)
     if playlist_kind:
         upstream_client = get_upstream_client(request.app)
@@ -5882,6 +6347,9 @@ async def static_cover(request: Request, subpath: str = ""):
     if nm_pl_id:
         cover = nmpl.cover_url_for(nm_pl_id)
         if cover:
+            proxied = await _cover_proxy_response(cover)
+            if proxied is not None:
+                return proxied
             return RedirectResponse(cover, status_code=302)
         return Response(status_code=404)
     if not is_online_guid(guid):
@@ -5895,13 +6363,19 @@ async def static_cover(request: Request, subpath: str = ""):
     if album_entry is not None:
         cover = str((album_entry.get("item") or {}).get("cover_url") or "")
         if cover and _KW_TEXT_COVER_HOST not in cover:
+            proxied = await _cover_proxy_response(cover)
+            if proxied is not None:
+                return proxied
             return RedirectResponse(cover, status_code=302)
         return _placeholder_cover_response(guid)
 
     data = await _online_info(request, guid)
     cover = str((data or {}).get("cover_url") or "")
-    # ① 已知直链封面直接 302；酷我文本封面（artistpicserver 返回的是文本页）除外
+    # ① 已知直链封面：代理缓存优先，失败 302 直链兜底；酷我文本封面（artistpicserver 返回的是文本页）除外
     if cover and _KW_TEXT_COVER_HOST not in cover:
+        proxied = await _cover_proxy_response(cover)
+        if proxied is not None:
+            return proxied
         return RedirectResponse(cover, status_code=302)
 
     # ② 按源+ID 直构 CDN：kw rid → artistpicserver 真图；qq albummid → gtimg
@@ -5912,11 +6386,17 @@ async def static_cover(request: Request, subpath: str = ""):
     if not direct:
         direct = _qq_cover_by_albummid((data or {}).get("albummid"))
     if direct:
+        proxied = await _cover_proxy_response(direct)
+        if proxied is not None:
+            return proxied
         return RedirectResponse(direct, status_code=302)
 
     # ③ 网易 cloudsearch 同名曲补全
     enriched = await _enrich_cover_via_netease(request, guid, data or {})
     if enriched:
+        proxied = await _cover_proxy_response(enriched)
+        if proxied is not None:
+            return proxied
         return RedirectResponse(enriched, status_code=302)
 
     # ④ 本地边听边存文件的内嵌专辑图
@@ -6029,6 +6509,9 @@ def build_favorite_track_obj(
     raw_info = dict(info or {})
     raw_info.setdefault("id", song_id_from_online_guid(guid))
     raw_info.setdefault("source", source_from_online_guid(guid))
+    # 登记表回填（统一出口）：收藏/历史/歌单附加条目的**快照**可能带占位值或空字段。
+    # 列表下发与播放详情必须同源，否则出现"播放界面歌名正常、列表里还是未知歌曲"。
+    raw_info = _registry_apply(guid, raw_info)
     vo = build_online_track(raw_info)
 
     now = int(time.time())
@@ -6154,27 +6637,38 @@ async def _online_favorite_set(request: Request) -> set[str]:
 
 
 async def _best_effort_online_info(request: Request, guid: str) -> dict:
-    """尽力获取在线曲目元数据：拉不到时从缓存反查兜底，绝不为 None（收藏/歌单快照共用）。"""
-    info = await _online_info(request, guid)
-    if info:
-        return info
+    """尽力获取在线曲目元数据：拉不到时从缓存反查兜底，绝不为 None（收藏/歌单快照共用）。
+
+    兜底来源之一是曲库/滚动缓存里已落盘音频的文件名（"艺术家 - 标题"）。**占位式
+    文件名（"未知歌手 - 未知曲目"）视为没有元数据**：它是 ≤2.7.4 落库的脏产物，
+    拿它当元数据会写进收藏/歌单快照，把占位值扩散到列表与后续每一次落盘。
+    """
+    info = await _online_info(request, guid) or {}
+    title, artist, album = _tag_fields(info)
+    if not (_is_real_tag(title) and _is_real_tag(artist)):
+        cached_media = find_cache_file(guid)
+        if cached_media:
+            base = os.path.splitext(os.path.basename(cached_media))[0]
+            if not onreg.is_placeholder_name(base):
+                if " - " in base:
+                    file_artist, file_title = base.split(" - ", 1)
+                    file_snap = {"title": file_title, "artist": file_artist}
+                else:
+                    file_snap = {"title": base}
+                title, artist, album = _merge_missing_tags(title, artist, album, file_snap)
+    out = dict(info)
+    if title:
+        out["title"] = title
+    if artist:
+        out["artist"] = artist
+    if album:
+        out["album"] = album
     cached_lyric = read_lyric_cache(guid)
-    title = ""
-    artist = ""
-    cached_media = find_cache_file(guid)
-    if cached_media:
-        base = os.path.splitext(os.path.basename(cached_media))[0]
-        if " - " in base:
-            artist, title = base.split(" - ", 1)
-        else:
-            title = base
-    return {
-        "id": song_id_from_online_guid(guid),
-        "source": source_from_online_guid(guid),
-        "title": title,
-        "artist": artist,
-        "lyric": cached_lyric,
-    }
+    if cached_lyric:
+        out["lyric"] = cached_lyric
+    out.setdefault("id", song_id_from_online_guid(guid))
+    out.setdefault("source", source_from_online_guid(guid))
+    return out
 
 
 @app.post("/music/api/v1/favorite-track/create")
@@ -6368,7 +6862,12 @@ async def favorite_track_list(request: Request):
         if not g:
             continue
         snapshot = it.get("track") if isinstance(it.get("track"), dict) else None
-        obj = build_favorite_track_obj(g, _snapshot_to_info(snapshot) if snapshot else None, created_at=it.get("createdAt"), template=template)
+        obj = build_favorite_track_obj(
+            g,
+            _heal_stored_meta(g, _snapshot_to_info(snapshot) if snapshot else None),
+            created_at=it.get("createdAt"),
+            template=template,
+        )
         obj["isFavorite"] = True
         online_tracks.append(disguise_client_json(obj))
 
@@ -6406,6 +6905,345 @@ def _recommend_kind_enabled(kind: str) -> bool:
 def _recommend_kinds_enabled() -> list[str]:
     """按开关返回要注入的推荐歌单类型（顺序即歌单列表顺序）。"""
     return [k for k in ("daily", "hot") if _recommend_kind_enabled(k)]
+
+
+# === 发现·歌单广场（platform_playlists） ===
+# 与 daily/hot 不同：平台推荐歌单是「公共内容」（不读个人历史/收藏），
+# 每次按当前平台白名单现拉，短 TTL 内存缓存（避免列表页反复打上游）。
+# 注入形态：每个平台推荐歌单 = 一张虚拟歌单卡（guid = discover:<src>:<pid>），
+# 点进去走 playlist_track_list 拉该平台歌单曲目。曲目播放仍走既有在线解析链。
+
+_DISCOVER_CACHE: dict[str, tuple[float, list[dict]]] = {}
+_DISCOVER_CACHE_TTL_S = 1800.0  # 30 分钟
+_DISCOVER_TRACK_CACHE: dict[str, tuple[float, list[dict]]] = {}
+_DISCOVER_TRACK_TTL_S = 900.0  # 单歌单曲目 15 分钟
+_DISCOVER_LOCK = asyncio.Lock()
+# 歌单封面直链反查表：discover 卡片的 coverId 下发为 fake 32-hex（App 只认该
+# 形态），cover 请求回来时须反解出原始直链才能 302。_FAKE_GUID_REVERSE 只由
+# 快照/历史等落盘数据 warm 重建，discover 封面不在其中（重启即丢），故单独
+# 记一张进程内 + 歌单级映射，并给 fake↔real 双向登记。
+_DISCOVER_COVER_REVERSE: dict[str, str] = {}
+_DISCOVER_COVER_FORWARD: dict[str, str] = {}
+_DISCOVER_COVER_MAX = 512
+
+
+def _discover_cover_id(cover_url: str, playlist_guid: str) -> str:
+    """歌单封面直链 → App 可用 coverId（`track_` + fake 32-hex），并登记反查。"""
+    real = str(cover_url or "").strip() or str(playlist_guid or "")
+    if not real:
+        return ""
+    fake = fake_official_guid(real)
+    if cover_url:
+        _DISCOVER_COVER_REVERSE[fake] = str(cover_url)
+        _DISCOVER_COVER_FORWARD[str(playlist_guid or "")] = str(cover_url)
+    if len(_DISCOVER_COVER_REVERSE) > _DISCOVER_COVER_MAX:
+        for k in list(_DISCOVER_COVER_REVERSE)[: _DISCOVER_COVER_MAX // 2]:
+            _DISCOVER_COVER_REVERSE.pop(k, None)
+    return "track_" + fake
+
+
+def _discover_cover_url(guid: str) -> str:
+    """discover guid（或已登记的 fake coverId）→ 封面直链；未登记返回 ""。"""
+    s = str(guid or "").strip()
+    if not s:
+        return ""
+    candidate = s
+    if candidate.startswith("track_"):
+        candidate = candidate[6:]
+    if candidate in _DISCOVER_COVER_REVERSE:
+        return _DISCOVER_COVER_REVERSE[candidate]
+    if s in _DISCOVER_COVER_FORWARD:
+        return _DISCOVER_COVER_FORWARD[s]
+    resolved = resolve_real_guid(s)
+    if resolved in _DISCOVER_COVER_REVERSE:
+        return _DISCOVER_COVER_REVERSE[resolved]
+    if resolved in _DISCOVER_COVER_FORWARD:
+        return _DISCOVER_COVER_FORWARD[resolved]
+    return ""
+
+
+def _discover_enabled() -> bool:
+    return bool(CONF.get("recommend_playlist", False))
+
+
+def _discover_sources() -> list[str]:
+    """要注入的平台列表：受白名单约束；空=全部受支持平台。"""
+    raw = str(CONF.get("recommend_playlist_source") or "").strip()
+    wanted = [s.strip() for s in raw.split(",") if s.strip()] if raw else list(plpl.SUPPORTED_PLATFORMS)
+    return [s for s in wanted if s in plpl.SUPPORTED_PLATFORMS]
+
+
+# 卡片元数据落盘索引：discover guid → {name, coverUrl, author, ...}。
+#
+# 为什么必须落盘：卡片本身的抓取缓存（_DISCOVER_CACHE）是**进程内**的，重启即空，
+# 而平台歌单广场接口（QQ musicu.fcg / 网易 playlist/list）在弱网、限流、被风控时
+# 会间歇性返回空。此时 playlist/list 拿不到卡片，App 仍持有重启前学到的 guid，
+# 会转而用 playlist/detail、playlist/batch-detail 反查歌单信息 —— 而那两个端点
+# 原先把名称**硬编码**成「QQ音乐推荐歌单」这类通用名，于是歌单列表就退化成
+# 一堆同名条目。把卡片元数据落盘后，名称/封面/作者能跨重启与上游故障存活。
+_DISCOVER_CARD_INDEX: dict[str, dict] = {}
+_DISCOVER_CARD_INDEX_LOADED = False
+_DISCOVER_CARD_INDEX_MAX = 2000
+_DISCOVER_CARD_INDEX_FILE = "discover-cards.json"
+_DISCOVER_CARD_INDEX_FIELDS = ("name", "coverUrl", "author", "trackCount",
+                               "playCount", "desc", "source", "playlistId")
+
+
+def _discover_card_index_path() -> str:
+    return os.path.join(dailyrec.recommend_cache_dir(), _DISCOVER_CARD_INDEX_FILE)
+
+
+def _load_discover_card_index() -> None:
+    """懒加载落盘索引；文件缺失/损坏一律静默降级为空索引。"""
+    global _DISCOVER_CARD_INDEX_LOADED
+    if _DISCOVER_CARD_INDEX_LOADED:
+        return
+    _DISCOVER_CARD_INDEX_LOADED = True
+    try:
+        with open(_discover_card_index_path(), "r", encoding="utf-8") as fh:
+            raw = json.load(fh)
+    except (OSError, ValueError):
+        return
+    items = raw.get("items") if isinstance(raw, dict) else None
+    if not isinstance(items, dict):
+        return
+    for guid, meta in items.items():
+        if isinstance(meta, dict) and isinstance(meta.get("name"), str) and meta["name"]:
+            _DISCOVER_CARD_INDEX[str(guid)] = meta
+    if _DISCOVER_CARD_INDEX:
+        logger.info("discover: 从磁盘恢复 %d 张推荐歌单卡片元数据",
+                    len(_DISCOVER_CARD_INDEX))
+
+
+def _save_discover_card_index() -> None:
+    path = _discover_card_index_path()
+    try:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
+            json.dump({"version": 1, "ts": time.time(), "items": _DISCOVER_CARD_INDEX},
+                      fh, ensure_ascii=False)
+        os.replace(tmp, path)
+    except OSError as exc:
+        logger.warning("discover: 卡片索引落盘失败 %s: %s", path, exc)
+
+
+def _remember_discover_cards(cards: list[dict]) -> None:
+    """成功的卡片抓取结果写入索引（名称非空才记，避免用空名覆盖已知真名）。"""
+    _load_discover_card_index()
+    dirty = False
+    for card in cards or []:
+        if not isinstance(card, dict):
+            continue
+        guid = str(card.get("guid") or "")
+        name = str(card.get("name") or "").strip()
+        if not guid or not name:
+            continue
+        _DISCOVER_CARD_INDEX[guid] = {
+            "guid": guid,
+            **{k: card.get(k) for k in _DISCOVER_CARD_INDEX_FIELDS},
+            "ts": time.time(),
+        }
+        dirty = True
+    if len(_DISCOVER_CARD_INDEX) > _DISCOVER_CARD_INDEX_MAX:
+        ordered = sorted(_DISCOVER_CARD_INDEX.items(),
+                         key=lambda kv: float((kv[1] or {}).get("ts") or 0))
+        for guid, _ in ordered[: len(_DISCOVER_CARD_INDEX) - _DISCOVER_CARD_INDEX_MAX]:
+            _DISCOVER_CARD_INDEX.pop(guid, None)
+        dirty = True
+    if dirty:
+        _save_discover_card_index()
+
+
+def _discover_card_meta(guid: str) -> dict:
+    """discover guid → 已知卡片元数据；未知返回 {}。"""
+    _load_discover_card_index()
+    meta = _DISCOVER_CARD_INDEX.get(str(guid or "").strip())
+    return meta if isinstance(meta, dict) else {}
+
+
+def _persisted_discover_cards(source: str) -> list[dict]:
+    """落盘索引里属于该平台的卡片（上游抓取失败时的兜底来源）。"""
+    _load_discover_card_index()
+    out: list[dict] = []
+    for meta in _DISCOVER_CARD_INDEX.values():
+        if not isinstance(meta, dict) or str(meta.get("source") or "") != source:
+            continue
+        pid = str(meta.get("playlistId") or "")
+        name = str(meta.get("name") or "").strip()
+        if pid and name:
+            out.append({"id": pid, "name": name, "source": source,
+                        "img": meta.get("coverUrl") or "",
+                        "total": meta.get("trackCount") or 0,
+                        "author": meta.get("author") or "",
+                        "play_count": meta.get("playCount") or "",
+                        "desc": meta.get("desc") or ""})
+    return out
+
+
+def _discover_platform_cards(source: str, cards: list[dict]) -> list[dict]:
+    """平台推荐歌单卡 → 虚拟歌单卡（App 歌单列表项形态）。
+
+    带 `discoverSource`/`discoverPlaylistId`/`discoverDesc` 等扩展字段，
+    由 playlist_list 组装成 App 期望的 playlist 记录。
+    """
+    out: list[dict] = []
+    for card in cards:
+        pid = str(card.get("id") or "")
+        name = str(card.get("name") or "").strip()
+        if not pid or not name:
+            continue
+        out.append({
+            "guid": dailyrec.discover_playlist_guid(source, pid),
+            "name": name,
+            "coverUrl": str(card.get("img") or ""),
+            "trackCount": int(card.get("total") or 0),
+            "author": str(card.get("author") or ""),
+            "playCount": str(card.get("play_count") or ""),
+            "desc": str(card.get("desc") or ""),
+            "source": source,
+            "playlistId": pid,
+        })
+    return out
+
+
+async def _fetch_discover_cards(source: str) -> list[dict]:
+    """拉某平台推荐歌单卡（带 TTL 内存缓存）。失败回落落盘索引，仍无则 []。"""
+    now = time.time()
+    cached = _DISCOVER_CACHE.get(source)
+    if cached and now - cached[0] < _DISCOVER_CACHE_TTL_S:
+        return cached[1]
+    client = get_platform_client(app)
+    limit = int(CONF.get("recommend_playlist_page_size") or 12)
+    async with _DISCOVER_LOCK:
+        cached = _DISCOVER_CACHE.get(source)
+        if cached and time.time() - cached[0] < _DISCOVER_CACHE_TTL_S:
+            return cached[1]
+        cards = await plpl.fetch_platform_playlists(client, source, "hot", 1, limit)
+        if not cards:
+            # 上游不可用（弱网/限流/风控）时不要整块消失：用落盘索引里的卡片兜底，
+            # 否则歌单列表只剩「通用名」条目（App 转而按 guid 反查详情）。
+            cards = _persisted_discover_cards(source)
+            if cards:
+                logger.info("discover: %s 上游不可用，回落落盘索引 %d 张卡片",
+                            source, len(cards))
+        if cards:
+            _DISCOVER_CACHE[source] = (time.time(), cards)
+    return cards
+
+
+async def _load_discover_playlists() -> list[dict]:
+    """汇总所有启用平台的推荐歌单卡（App 歌单列表用）。"""
+    sources = _discover_sources()
+    if not sources:
+        return []
+    results = await asyncio.gather(
+        *(_fetch_discover_cards(s) for s in sources), return_exceptions=True
+    )
+    out: list[dict] = []
+    for source, cards in zip(sources, results):
+        if isinstance(cards, Exception) or not cards:
+            continue
+        out.extend(_discover_platform_cards(source, cards))
+    # 记下真名/封面/作者：歌单列表之外（playlist/detail、batch-detail、重启后）
+    # 还要靠这份索引还原歌单名，否则只剩硬编码的「XX音乐推荐歌单」。
+    if out:
+        _remember_discover_cards(out)
+    return out
+
+
+async def _load_discover_tracks(source: str, playlist_id: str) -> list[dict]:
+    """拉某平台歌单曲目 → 在线 Track VO 列表（带 TTL 缓存）。失败返回 []。"""
+    key = f"{source}:{playlist_id}"
+    now = time.time()
+    cached = _DISCOVER_TRACK_CACHE.get(key)
+    if cached and now - cached[0] < _DISCOVER_TRACK_TTL_S:
+        return cached[1]
+    client = get_platform_client(app)
+    items = await plpl.fetch_playlist_tracks(client, source, playlist_id, 100)
+    tracks = [t for t in (build_online_track(it) for it in items) if t]
+    if tracks:
+        # 登记真实元数据：这些曲目不走搜索，_SEARCH_CACHE 里没有它们，
+        # 播放时 metadata 接口只能拿到 lxserver 合成的"未知曲目/未知歌手"。
+        onreg.REGISTRY.record_tracks(tracks)
+        if len(_DISCOVER_TRACK_CACHE) > 200:
+            # 简单裁剪：清空最早的一半（key 无序，按写入时间近似）
+            for k in list(_DISCOVER_TRACK_CACHE)[: len(_DISCOVER_TRACK_CACHE) // 2]:
+                _DISCOVER_TRACK_CACHE.pop(k, None)
+        _DISCOVER_TRACK_CACHE[key] = (time.time(), tracks)
+    return tracks
+
+
+def _discover_card_record(card: dict) -> dict:
+    """虚拟歌单卡 → App `playlist/list` 记录（与 _playlist_public_fields 同风格）。"""
+    guid = str(card.get("guid") or "")
+    cover = str(card.get("coverUrl") or "")
+    # coverId 需伪装成官方 track_+32hex 形态，否则 App 按 id 格式过滤不渲染；
+    # 同时登记反查（静态封面端点据此 302 到平台封面直链）。
+    cover_id = _discover_cover_id(cover, guid)
+    ts = int(time.time())
+    return {
+        "guid": card.get("guid"),
+        "name": card.get("name") or "推荐歌单",
+        "coverId": cover_id,
+        "createdAt": ts,
+        "updatedAt": ts,
+        "trackCount": int(card.get("trackCount") or 0),
+        "isDaily": True,
+        # 扩展字段（App 忽略未知键；便于排查与前端可选展示）
+        "source": card.get("source") or "",
+        "author": card.get("author") or "",
+        "playCount": card.get("playCount") or "",
+        "desc": card.get("desc") or "",
+        "_discover": True,
+    }
+
+
+def _discover_detail_record(guid: str, source: str, playlist_id: str,
+                            track_count: int) -> dict:
+    """discover 歌单详情记录（`playlist/detail` / `batch-detail` 用）。
+
+    曲目列表为空（平台接口不可用/被限流）时 trackCount 记 0，App 显示空歌单，
+    不会崩（与仓库「某栏目不可用降级」风格一致）；封面从卡片反查表取，
+    重启后反查表为空则回落 guid 派生假 coverId（静态封面端点会再尝试拉曲目取图）。
+    """
+    ts = int(time.time())
+    meta = _discover_card_meta(guid)
+    # 优先用抓到的真实歌单名；只有从未成功抓到过卡片时才退回平台通用名。
+    name = str(meta.get("name") or "").strip()
+    if not name:
+        label = plpl.platform_label(source)
+        name = f"{label}推荐歌单" if label else "平台推荐歌单"
+    cover_id = ""
+    direct = _discover_cover_url(guid) or str(meta.get("coverUrl") or "").strip()
+    if direct:
+        cover_id = _discover_cover_id(direct, guid)
+    else:
+        cover_id = "track_" + fake_official_guid(guid)
+    try:
+        count = int(track_count or 0)
+    except (TypeError, ValueError):
+        count = 0
+    if not count:
+        try:
+            count = int(meta.get("trackCount") or 0)
+        except (TypeError, ValueError):
+            count = 0
+    return {
+        "guid": guid,
+        "name": name,
+        "coverId": cover_id,
+        "createdAt": ts,
+        "updatedAt": ts,
+        "trackCount": count,
+        "isDaily": True,
+        "source": source,
+        "playlistId": playlist_id,
+        "author": str(meta.get("author") or ""),
+        "playCount": str(meta.get("playCount") or ""),
+        "desc": str(meta.get("desc") or ""),
+        "_discover": True,
+    }
 
 
 def _is_shared_user_guid(user_guid: str) -> bool:
@@ -6855,8 +7693,10 @@ async def playlist_list(request: Request):
     kinds = _recommend_injectable_kinds(user_guid)
     # 网易账号歌单：实例级内容（同热门推荐），shared 会话同样可见
     nm_on = bool(CONF.get("netease_my_playlists")) and bool(CONF.get("netease_enabled"))
-    if not kinds and not nm_on:
-        # 两个推荐开关全关（或 shared 会话无任何可注入类型）且账号歌单关闭：不注入
+    # 平台推荐歌单（发现·歌单广场）：公共内容，不读个人历史/收藏，shared 会话同样可见
+    discover_on = _discover_enabled() and bool(_discover_sources())
+    if not kinds and not nm_on and not discover_on:
+        # 推荐开关全关（或 shared 会话无任何可注入类型）且账号歌单/平台歌单关闭：不注入
         return JSONResponse(content=envelope, headers=headers)
 
     data = envelope.get("data")
@@ -6895,13 +7735,23 @@ async def playlist_list(request: Request):
             nm_cards = []
         if nm_cards:
             nmpl.schedule_prefetch(get_musicbox_client(request.app), build_online_track, nm_cards)
+    discover_cards: list[dict] = []
+    if discover_on:
+        try:
+            discover_cards = [
+                _discover_card_record(c) for c in await _load_discover_playlists()
+            ]
+        except Exception as e:
+            logger.warning("discover playlists inject failed: %s", e)
+            discover_cards = []
     official = [
         it for it in official
         if not (isinstance(it, dict) and dailyrec.is_recommend_playlist_guid(str(it.get("guid") or "")))
     ]
-    data["list"] = recs + nm_cards + official
+    data["list"] = recs + nm_cards + discover_cards + official
     total = data.get("total")
-    data["total"] = (total if isinstance(total, int) else len(official)) + len(recs) + len(nm_cards)
+    data["total"] = ((total if isinstance(total, int) else len(official))
+                     + len(recs) + len(nm_cards) + len(discover_cards))
     return JSONResponse(content=envelope, headers=headers)
 
 
@@ -6918,6 +7768,12 @@ async def playlist_detail(request: Request):
         tracks = nmpl.cached_tracks(nm_pl_id)
         if tracks is not None:
             card = {**card, "trackCount": len(tracks)}
+        return JSONResponse(content={"code": 0, "msg": "ok", "data": card})
+    # 平台推荐歌单（discover）：详情 = 卡片信息 + 实际曲目数（拉一次曲目缓存）
+    source, disc_pid = dailyrec.parse_discover_playlist_guid(guid)
+    if source and disc_pid:
+        tracks = await _load_discover_tracks(source, disc_pid)
+        card = _discover_detail_record(guid, source, disc_pid, len(tracks))
         return JSONResponse(content={"code": 0, "msg": "ok", "data": card})
     kind = dailyrec.online_playlist_kind(guid)
     if not kind:
@@ -6957,14 +7813,18 @@ async def playlist_detail(request: Request):
 async def playlist_batch_detail(request: Request):
     raw = request.query_params.get("guids") or request.query_params.get("guid") or ""
     guids = [g.strip() for g in raw.split(",") if g.strip()]
-    recommend_ids = [g for g in guids if dailyrec.is_recommend_playlist_guid(g)]
+    recommend_ids = [
+        g for g in guids
+        if dailyrec.is_recommend_playlist_guid(g) and not dailyrec.is_discover_playlist_guid(g)
+    ]
+    discover_ids = [g for g in guids if dailyrec.is_discover_playlist_guid(g)]
     nm_ids = [
         pid for pid in (
             nmpl.nm_playlist_id_from_guid(g) or nmpl.nm_playlist_id_from_guid(resolve_real_guid(g))
             for g in guids
         ) if pid
     ]
-    if not recommend_ids and not nm_ids and not plt_dir_has_data():
+    if not recommend_ids and not discover_ids and not nm_ids and not plt_dir_has_data():
         return await forward_to_upstream(request, get_upstream_client(request.app))
 
     upstream_client = get_upstream_client(request.app)
@@ -7013,6 +7873,12 @@ async def playlist_batch_detail(request: Request):
         rec = _playlist_public_fields(bundle.get("playlist") or {}, bundle.get("tracks") or [])
         rec["trackCount"] = len(bundle.get("tracks") or [])
         recs.append(rec)
+    for g in discover_ids:
+        src, pid = dailyrec.parse_discover_playlist_guid(g)
+        if not src or not pid:
+            continue
+        tracks = await _load_discover_tracks(src, pid)
+        recs.append(_discover_detail_record(g, src, pid, len(tracks)))
     for pid in nm_ids:
         card = nmpl.card_for(pid)
         if card is not None:
@@ -7033,6 +7899,36 @@ async def playlist_track_list(request: Request):
     ).strip()
     kind = dailyrec.online_playlist_kind(guid)
     nm_pl_id = nmpl.nm_playlist_id_from_guid(guid) or nmpl.nm_playlist_id_from_guid(resolve_real_guid(guid))
+    if not nm_pl_id:
+        # 平台推荐歌单（discover）：按平台接口现拉曲目 → VO 分页下发。
+        # 曲目 VO 的 guid 是 online:lx:<platform>:<id>，播放/收藏/歌词走既有链。
+        disc_src, disc_pid = dailyrec.parse_discover_playlist_guid(guid)
+        if disc_src and disc_pid:
+            try:
+                page = max(int(request.query_params.get("page") or 1), 1)
+            except (TypeError, ValueError):
+                page = 1
+            try:
+                size = int(request.query_params.get("size") or 50)
+            except (TypeError, ValueError):
+                size = 50
+            if size < 1:
+                size = 50
+            # 一次拉满上游（缓存命中则零成本），再按请求窗口切片
+            tracks = dailyrec.stamp_playlist_tracks(
+                list(await _load_discover_tracks(disc_src, disc_pid))
+            )
+            size = max(len(tracks), 1) if size == -1 else size
+            start = (page - 1) * size
+            page_tracks = tracks[start:start + size]
+            return JSONResponse(
+                content=disguise_client_json({
+                    "code": 0,
+                    "msg": "ok",
+                    "data": {"list": page_tracks, "total": len(tracks),
+                             "sort": request.query_params.get("sort") or ""},
+                })
+            )
     if nm_pl_id:
         # 网易账号歌单曲目：可播过滤后的 VO 分页下发（与推荐歌单同款分页语义）
         upstream_client = get_upstream_client(request.app)
@@ -7042,6 +7938,8 @@ async def playlist_track_list(request: Request):
         tracks = dailyrec.stamp_playlist_tracks(
             await nmpl.load_tracks(get_musicbox_client(request.app), nm_pl_id, build_online_track)
         )
+        # 同 discover：网易账号歌单曲目也不走搜索，登记元数据供播放时回填
+        onreg.REGISTRY.record_tracks(tracks)
         try:
             page = max(int(request.query_params.get("page") or 1), 1)
         except (TypeError, ValueError):
@@ -7104,7 +8002,8 @@ async def playlist_track_list(request: Request):
                 continue
             snapshot = it.get("track") if isinstance(it.get("track"), dict) else None
             obj = build_favorite_track_obj(
-                g, _snapshot_to_info(snapshot) if snapshot else None,
+                g,
+                _heal_stored_meta(g, _snapshot_to_info(snapshot) if snapshot else None),
                 created_at=it.get("addedAt"), template=template,
             )
             obj["isFavorite"] = g in fav_guids
@@ -7137,8 +8036,18 @@ async def playlist_track_list(request: Request):
     is_authed, user_guid, auth_resp = await _probe_upstream_auth(request, upstream_client)
     if not is_authed and auth_resp is not None:
         return auth_resp
+    if kind == "discover":
+        # 防御性兜底：discover 已在上面早返回，此处只在 guid 解析异常时到达
+        return JSONResponse(
+            content=disguise_client_json({
+                "code": 0, "msg": "ok",
+                "data": {"list": [], "total": 0, "sort": request.query_params.get("sort") or ""},
+            })
+        )
     bundle = await _load_daily_bundle(request, user_guid, kind)
     tracks = dailyrec.stamp_playlist_tracks(list(bundle.get("tracks") or []))
+    # daily/hot 含本地曲库兜底条目，record_tracks 内部按 online: 前缀过滤，只登记在线曲目
+    onreg.REGISTRY.record_tracks(tracks)
     try:
         page = max(int(request.query_params.get("page") or 1), 1)
     except (TypeError, ValueError):
@@ -7352,7 +8261,7 @@ async def _aggregate_album_detail_payload(request: Request, entry: dict) -> dict
             continue
         if source_from_online_guid(g) != src:
             continue
-        info = _normalize_album_candidate(it)
+        info = _registry_apply(g, _normalize_album_candidate(it))
         if str(info.get("album") or "").strip() != album_name:
             continue
         seen_guids.add(g)
@@ -7714,10 +8623,10 @@ async def event_report(request: Request):
         if is_authed:
             async with _HISTORY_LOCK:
                 for guid, payload in online_plays:
-                    info = stub_online_info(guid)
-                    title = str(info.get("title") or "").strip()
-                    artist = str(info.get("artist") or "").strip()
-                    album = ""
+                    # 登记表入链（与播放详情、落盘链路同一张表）：这些曲目多半来自
+                    # 推荐/平台/网易歌单，从不经过搜索，_SEARCH_CACHE 必然落空。
+                    info = _registry_apply(guid, stub_online_info(guid))
+                    title, artist, album = _tag_fields(info)
                     duration_s = None
                     if payload:
                         # 客户端上报若带元数据（App/Web 字段名可能不同）优先采信，
@@ -7732,44 +8641,54 @@ async def event_report(request: Request):
                         })
                         # 客户端上报的是搜索列表里带来源标记的显示名，入库前剥离
                         p_title = strip_source_tag(p_title)
-                        title = p_title or title
-                        artist = p_artist or artist
-                        album = p_album or album
+                        # 上报值优先（它正是这一刻播放的显示名），占位值则让位给登记表
+                        title, artist, album = _merge_missing_tags(
+                            p_title, p_artist, p_album,
+                            {"title": title, "artist": artist, "album": album},
+                        )
                         raw_dur = payload.get("duration") or payload.get("durationMs") or payload.get("duration_ms")
                         try:
                             dv = float(raw_dur)
                             duration_s = dv / 1000.0 if dv > 10000 else dv
                         except (TypeError, ValueError):
                             duration_s = None
-                    if not title or not artist or not album:
+                    if not (_is_real_tag(title) and _is_real_tag(artist) and _is_real_tag(album)):
                         # 事件不带元数据时从内存搜索会话补齐（播放时会话必在）
                         retained, _entry = _retained_track(request, guid)
                         if retained:
-                            r_title, r_artist, r_album = _tag_fields(retained)
-                            title = title or r_title
-                            artist = artist or r_artist
-                            album = album or r_album
+                            title, artist, album = _merge_missing_tags(title, artist, album, retained)
                             if not duration_s:
                                 try:
                                     duration_s = float(retained.get("duration_s") or 0) or None
                                 except (TypeError, ValueError):
                                     duration_s = None
-                        if not title or not artist or not album:
+                        if not (_is_real_tag(title) and _is_real_tag(artist) and _is_real_tag(album)):
                             served = _lookup_playlist_cache_track(guid)
                             if served:
-                                s_title, s_artist, s_album = _tag_fields(served)
-                                title = title or s_title
-                                artist = artist or s_artist
-                                album = album or s_album
+                                title, artist, album = _merge_missing_tags(title, artist, album, served)
                     cached = find_cache_file(guid)
-                    if cached and (not title or not artist):
+                    if cached and not (_is_real_tag(title) and _is_real_tag(artist)):
                         base = os.path.splitext(os.path.basename(cached))[0]
-                        if " - " in base:
-                            file_artist, file_title = base.split(" - ", 1)
-                            artist = artist or file_artist
-                            title = title or file_title
-                        else:
-                            title = title or base
+                        # 占位式文件名（≤2.7.4 落库的 "未知歌手 - 未知曲目"）不是元数据来源
+                        if not onreg.is_placeholder_name(base):
+                            if " - " in base:
+                                file_artist, file_title = base.split(" - ", 1)
+                                title, artist, album = _merge_missing_tags(
+                                    title, artist, album,
+                                    {"title": file_title, "artist": file_artist},
+                                )
+                            else:
+                                title, artist, album = _merge_missing_tags(
+                                    title, artist, album, {"title": base},
+                                )
+                    # 上游占位值（"未知曲目/未知歌手"）不入库：存成空值，列表下发时
+                    # 由 _heal_stored_meta 再补，避免脏快照把兜底链一次钉死。
+                    if not _is_real_tag(title):
+                        title = ""
+                    if not _is_real_tag(artist):
+                        artist = ""
+                    if not _is_real_tag(album):
+                        album = ""
                     snapshot = {
                         "guid": guid,
                         "title": title,
@@ -7841,20 +8760,24 @@ async def play_history_list(request: Request):
         if not guid:
             continue
         track = it.get("track") if isinstance(it.get("track"), dict) else {}
-        info = _snapshot_to_info(track) if track else None
-        if not (info or {}).get("title"):
-            # 历史快照可能没带元数据：从内存搜索会话补齐（无网络开销）
+        info = _heal_stored_meta(guid, _snapshot_to_info(track) if track else None)
+        c_title, c_artist, c_album = _tag_fields(info)
+        if not (_is_real_tag(c_title) and _is_real_tag(c_artist)):
+            # 历史快照可能没带（或只带上游占位）元数据：从内存搜索会话补齐（无网络开销）
             retained, _entry = _retained_track(request, guid)
             if retained:
                 r_title, r_artist, r_album = _tag_fields(retained)
-                info = {
-                    **(info or {}),
-                    "title": r_title,
-                    "artist": r_artist,
-                    "album": r_album,
-                    "duration_s": retained.get("duration_s") or 0,
-                    "ext": retained.get("ext") or "",
-                }
+                c_title, c_artist, c_album = _merge_missing_tags(
+                    c_title, c_artist, c_album,
+                    {"title": r_title, "artist": r_artist, "album": r_album},
+                )
+                info = {**info, "title": c_title, "artist": c_artist}
+                if c_album:
+                    info["album"] = c_album
+                if not info.get("duration_s"):
+                    info["duration_s"] = retained.get("duration_s") or 0
+                if not info.get("ext"):
+                    info["ext"] = retained.get("ext") or ""
         obj = build_favorite_track_obj(guid, info, created_at=int(it.get("playedAt") or time.time()), template=template)
         obj["isFavorite"] = guid in fav_set
         online_tracks.append(disguise_client_json(obj))

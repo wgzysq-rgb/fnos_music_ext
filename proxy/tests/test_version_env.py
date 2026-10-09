@@ -160,6 +160,9 @@ def test_merge_same_version_reinstall_keeps_everything():
     assert m["FNMUSIC_HOME"] == "/custom/home"
 
 
+@pytest.mark.skipif(
+    os.name == "nt", reason="POSIX 权限位 0600 在 Windows 上无法表达（CI/Linux 覆盖）"
+)
 def test_write_env_atomic_permissions_and_content(tmp_path):
     out = tmp_path / ".env"
     env_merge.write_env_atomic(out, env_merge.render_env(DESIRED))
@@ -237,6 +240,9 @@ def test_cli_merge_auto_adds_lx_config(tmp_path):
     assert env_merge.LX_COMMENT in text
 
 
+@pytest.mark.skipif(
+    os.name == "nt", reason="POSIX 权限位 0600 在 Windows 上无法表达（CI/Linux 覆盖）"
+)
 def test_cli_end_to_end_merge(tmp_path, capsys):
     existing = tmp_path / ".env"
     existing.write_text(

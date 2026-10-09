@@ -44,6 +44,13 @@ jobs:
             bash -n "$script"
           done < <(git ls-files -z '*.sh')
 
+      # 行尾门禁：CRLF 会让 Linux 上的 install.sh 直接失败
+      # （./install.sh: line 2: set: pipefail: invalid option name）
+      - name: Line ending check (LF enforced)
+        run: |
+          git config core.autocrlf false
+          python scripts/check_eol.py --strict
+
       - name: Python compile check
         run: >
           python -m py_compile proxy/app.py proxy/recommend.py proxy/env_merge.py proxy/version.py
@@ -99,6 +106,10 @@ jobs:
           tar -tzf "$fpk_file" | grep -E '^manifest$'
           tar -tzf "$fpk_file" | grep -E '^ICON\.PNG$'
           ( cd dist && sha256sum -c "$(basename "$fpk_file").sha256" )
+
+      # 归档内文本必须 LF，否则装到 NAS 上执行脚本会直接失败
+      - name: Verify package line endings
+        run: python scripts/check_eol.py --fpk "$(ls dist/fnmusic-ext-*.fpk)"
 
 
   production:

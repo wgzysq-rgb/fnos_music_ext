@@ -27,6 +27,14 @@ BASH = shutil.which("bash")
 if BASH is None:
     pytest.skip("bash 不可用", allow_module_level=True)
 
+# Windows 的 PortableGit bash 跑不了这些脚本片段（`set -euo pipefail` 语义、
+# 进程替换、/proc 读取都不一致）——这不是被测代码的缺陷，是执行环境差异。
+# 覆盖由 CI（Linux）保证，本机直接整文件跳过（也省下最慢的 ~4 分钟）。
+pytestmark = pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="install.sh/extend.sh 片段需真实 POSIX shell（CI/Linux 覆盖）",
+)
+
 
 def function(text: str, name: str) -> str:
     start = text.index(name + "() {")
