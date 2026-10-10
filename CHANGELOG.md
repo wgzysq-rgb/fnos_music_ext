@@ -5,6 +5,40 @@
 
 ## [Unreleased]
 
+## [2.7.11] - 2026-10-10
+
+### 修复
+
+- **「歌单广场」推荐歌单列表与详情全部没有封面（占位图）**：App 取封面走的是
+  `coverId`，而 discover 卡的 `coverId` 是一个由**封面直链**派生的假 32-hex
+  （`_discover_cover_id` → `fake_official_guid(cover_url)`）。`/static/cover`
+  入口先做 `extract_guid` → `resolve_real_guid`，于是 coverId 被反解成
+  `http://p.qpic.cn/...` 这样的**直链**；拿直链去做
+  `is_discover_playlist_guid()` 必然为假 → 整块 discover 分支被跳过 →
+  封面退成占位图。
+  - 老测试只覆盖 `?guid=online:playlist:discover:...` 路径（该路径
+    `resolve_real_guid` 反解不出、原样返回，判定为真），所以一直全绿；
+    **App 实际使用的 coverId 路径没有任何用例**，bug 就这样藏了很久。
+  - 新增 `_resolve_discover_guid()`：按「resolve 后 guid → 原始候选值 →
+    候选值再 resolve → coverId 反查歌单 guid」四步判定归属，任一命中即按
+    discover 处理。
+  - 新增 `_discover_guid_by_cover()`：coverId → 歌单 guid 反查，先查进程内
+    正向表，再查落盘卡片索引。
+  - `_load_discover_card_index()` 加载索引时**顺带重建封面反查表**
+    （`_DISCOVER_COVER_REVERSE` / `_DISCOVER_COVER_FORWARD`）。fake 是单向
+    哈希，不 warm 就永远反解不出——这修掉了「重启后 App 持旧 coverId 取封面
+    必然失败」的窗口。
+  - 实测确认 5 个平台（tx/wy/kw/kg/mg）共 60 张卡片**全部带封面直链**、
+    且代理侧均能成功下载（HTTP 200），故「无封面」纯属渲染侧问题。
+
+### 测试
+
+- 新增 `test_static_cover_by_coverid_redirects`：覆盖 App 实际使用的
+  `coverId` 路径，含带 `size` 参数与 `/<coverId>` 路径两种形态。
+- 新增 `test_static_cover_by_coverid_survives_restart`：模拟重启（清空全部
+  进程内表、保留落盘索引），验证 coverId 仍能出图。
+- `test_playlist_detail_returns_discover_card` 补详情页 coverId 出图断言。
+
 ## [2.7.10] - 2026-10-10
 
 ### 修复

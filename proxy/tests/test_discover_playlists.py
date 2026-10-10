@@ -222,6 +222,15 @@ def test_playlist_detail_returns_discover_card(monkeypatch):
         assert body["code"] == 0
         assert body["data"]["guid"] == "online:playlist:discover:wy:PLID1"
         assert body["data"]["trackCount"] == 2
+        # 详情页封面：detail 下发的 coverId 也必须能取到图（否则点进去无图）。
+        # 本用例未先走 playlist/list，卡片封面未登记 → 走「拉曲目取首图」兜底，
+        # 取到曲目封面即可（重点是**不能**退成占位图）。
+        cover_id = body["data"]["coverId"]
+        assert cover_id.startswith("track_")
+        cover = client.get("/music/api/v1/static/cover", params={"coverId": cover_id},
+                           follow_redirects=False)
+        assert cover.status_code == 302, f"详情页 coverId 未出图: {cover.content[:120]}"
+        assert cover.headers["location"] in ("http://img.test/1.jpg", "http://c/1.jpg")
 
 
 def test_batch_detail_returns_discover_card(monkeypatch):
@@ -272,6 +281,73 @@ def test_static_cover_redirects_to_platform_cover(monkeypatch):
                           follow_redirects=False)
         assert resp.status_code == 302
         assert resp.headers["location"] == "http://img.test/1.jpg"
+
+
+def test_static_cover_by_coverid_redirects(monkeypatch):
+    """App 实际用的是 coverId，不是 guid —— 这条路必须有封面。
+
+    历史 bug：discover 卡的 coverId fake 由**封面直链**派生，于是
+    `resolve_real_guid(coverId)` 反解出的是 `http://...` 直链，拿直链去做
+    `is_discover_playlist_guid` 必然 False → 整块 discover 分支被跳过 →
+    占位图（列表卡片与详情都没图）。guid 路径能出图，所以老测试全绿。
+    """
+    _patch_platform(monkeypatch, "wy", _stub_cards(), _stub_tracks())
+    app.state.upstream_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(_auth_user()), base_url="http://unix"
+    )
+    with TestClient(app) as client:
+        data = client.get("/music/api/v1/playlist/list").json()["data"]
+        card = [it for it in data["list"]
+                if dailyrec.is_discover_playlist_guid(str(it.get("guid") or ""))][0]
+        cover_id = card["coverId"]
+        assert cover_id.startswith("track_")
+        # 裸 coverId（App 形态）
+        resp = client.get("/music/api/v1/static/cover", params={"coverId": cover_id},
+                          follow_redirects=False)
+        assert resp.status_code == 302, f"coverId 路径未走到 discover 分支: {resp.content[:120]}"
+        assert resp.headers["location"] == "http://img.test/1.jpg"
+        # 带 size 参数（App 列表缩略图会带）
+        resp2 = client.get("/music/api/v1/static/cover",
+                           params={"coverId": cover_id, "size": "120"},
+                           follow_redirects=False)
+        assert resp2.status_code == 302
+        assert resp2.headers["location"] == "http://img.test/1.jpg"
+        # 路径形态 /static/cover/<coverId>
+        resp3 = client.get(f"/music/api/v1/static/cover/{cover_id}",
+                           follow_redirects=False)
+        assert resp3.status_code == 302
+        assert resp3.headers["location"] == "http://img.test/1.jpg"
+
+
+def test_static_cover_by_coverid_survives_restart(monkeypatch):
+    """重启后进程内反查表清空，coverId 仍要靠落盘卡片索引出图。
+
+    App 会长期持有重启前学到的 coverId，重启后直接拿它取封面；此时
+    `_DISCOVER_COVER_REVERSE`/`_FAKE_GUID_REVERSE` 都是空的，只有
+    `_DISCOVER_CARD_INDEX`（落盘）还认得这张卡。
+    """
+    _patch_platform(monkeypatch, "wy", _stub_cards(), _stub_tracks())
+    app.state.upstream_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(_auth_user()), base_url="http://unix"
+    )
+    with TestClient(app) as client:
+        data = client.get("/music/api/v1/playlist/list").json()["data"]
+        card = [it for it in data["list"]
+                if dailyrec.is_discover_playlist_guid(str(it.get("guid") or ""))][0]
+        cover_id = card["coverId"]
+        guid = card["guid"]
+        # 模拟重启：清空全部进程内表，但磁盘索引文件保留
+        _DISCOVER_COVER_REVERSE.clear()
+        _DISCOVER_COVER_FORWARD.clear()
+        appmod._FAKE_GUID_REVERSE.clear()
+        _DISCOVER_CARD_INDEX.clear()
+        monkeypatch.setattr(appmod, "_DISCOVER_CARD_INDEX_LOADED", False)
+        # coverId 仍应出图（经落盘索引反查歌单 guid → 直链）
+        resp = client.get("/music/api/v1/static/cover", params={"coverId": cover_id},
+                          follow_redirects=False)
+        assert resp.status_code == 302, f"重启后 coverId 未出图: {resp.content[:120]}"
+        assert resp.headers["location"] == "http://img.test/1.jpg"
+        assert appmod._discover_guid_by_cover(cover_id) == guid
 
 
 def test_discover_disabled_no_injection(monkeypatch):

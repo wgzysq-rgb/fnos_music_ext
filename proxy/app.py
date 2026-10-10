@@ -6413,6 +6413,21 @@ async def static_cover(request: Request, subpath: str = ""):
 
 
 async def _static_cover_impl(request: Request, subpath: str = ""):
+    # discover 封面必须用**原始候选值**判定，不能用 resolve_real_guid 之后的值：
+    # App 传的是 coverId=`track_<fake>`，而 discover 卡的 fake 是由**封面直链**
+    # 派生（_discover_cover_id → fake_official_guid(cover_url)），于是
+    # resolve_real_guid 会把 coverId 反解成 `http://...` 直链 —— 拿直链去做
+    # is_discover_playlist_guid 必然 False，整块 discover 分支被跳过，封面退成
+    # 占位图（历史 bug：guid 路径能出图、App 实际用的 coverId 路径出不了）。
+    # 这里保留 raw，discover 判定/反查两个值都试。
+    raw_candidate = (
+        request.query_params.get("coverId")
+        or request.query_params.get("guid")
+        or (subpath if subpath else "")
+        or ""
+    ).strip()
+    if raw_candidate.startswith("/"):
+        raw_candidate = raw_candidate.strip("/").split("/")[-1]
     guid = extract_guid(request, subpath if is_online_guid(subpath) else None)
     if not guid and subpath.startswith("online:"):
         guid = subpath
@@ -6423,8 +6438,18 @@ async def _static_cover_impl(request: Request, subpath: str = ""):
     # 平台推荐歌单（discover）：卡片封面直链登记在 _DISCOVER_COVER_REVERSE，
     # guid 或 coverId 反解出直链即 302；未登记的回落到歌单曲目首图。
     # 必须排在 daily/hot 分支之前——discover 不按日构建，没有 daily 缓存。
-    if dailyrec.is_discover_playlist_guid(guid):
+    #
+    # 归属判定要同时考虑三个来源（任一命中即按 discover 处理）：
+    #   1. resolve 后的 guid（原生 `online:playlist:discover:...` 形态）；
+    #   2. 原始候选值本身（可能已是 discover guid）；
+    #   3. coverId → 歌单 guid 反查（进程内正向表 → 落盘卡片索引，覆盖重启）。
+    disc_guid = _resolve_discover_guid(raw_candidate, guid)
+    if disc_guid:
+        guid = disc_guid
         direct = _discover_cover_url(guid)
+        if not direct and raw_candidate:
+            # 反查到的是歌单 guid，直链可能只按 fake/coverId 登记过
+            direct = _discover_cover_url(raw_candidate)
         if direct:
             proxied = await _cover_proxy_response(direct)
             if proxied is not None:
@@ -7097,6 +7122,64 @@ _DISCOVER_COVER_FORWARD: dict[str, str] = {}
 _DISCOVER_COVER_MAX = 512
 
 
+def _resolve_discover_guid(raw_candidate: str, resolved_guid: str) -> str:
+    """判定封面请求是否属于 discover 歌单，返回其歌单 guid；否返回 ""。
+
+    依次尝试（任一命中即返回）：
+      1. 已 resolve 的 guid 本身就是 discover guid；
+      2. 原始候选值（未过 resolve_real_guid）就是 discover guid；
+      3. 原始候选值经 resolve_real_guid 后是 discover guid；
+      4. 把原始候选值当 coverId，反查歌单 guid（进程内正向表 → 落盘卡片索引）。
+
+    第 4 条是修 bug 的关键：App 传的 coverId 的 fake 由**封面直链**派生，
+    `resolve_real_guid` 只能还原出直链，永远得不到 discover guid，必须走反查。
+    """
+    for cand in (resolved_guid, raw_candidate):
+        if cand and dailyrec.is_discover_playlist_guid(cand):
+            return str(cand)
+    if raw_candidate:
+        r = resolve_real_guid(raw_candidate)
+        if dailyrec.is_discover_playlist_guid(r):
+            return r
+        return _discover_guid_by_cover(raw_candidate)
+    return ""
+
+
+def _discover_guid_by_cover(candidate: str) -> str:
+    """coverId（`track_<fake>` 或裸 fake）→ discover 歌单 guid；查不到返回 ""。
+
+    `_discover_cover_id` 把 coverId 的 fake 由**封面直链**派生，所以
+    `resolve_real_guid(coverId)` 得到的是直链而非歌单 guid，无法据此判定
+    discover 归属。这里用 `_DISCOVER_COVER_REVERSE` 拿回直链，再拿直链在
+    `_DISCOVER_COVER_FORWARD`（playlist_guid → 直链）里反查歌单 guid。
+
+    进程内表为空（重启后）时，用落盘卡片索引 `_DISCOVER_CARD_INDEX` 的
+    `coverUrl` 反查——索引跨重启存活，能覆盖「重启后 App 持旧 coverId 直取」
+    的窗口。
+    """
+    s = str(candidate or "").strip()
+    if not s:
+        return ""
+    if s.startswith("track_"):
+        s = s[6:]
+    # 先加载落盘索引：它会顺带重建 _DISCOVER_COVER_REVERSE/_FORWARD
+    # （重启后进程内表是空的，不 warm 就永远反解不出直链）。
+    _load_discover_card_index()
+    direct = _DISCOVER_COVER_REVERSE.get(s) or _discover_cover_url(candidate)
+    if not direct:
+        return ""
+    for pguid, purl in _DISCOVER_COVER_FORWARD.items():
+        if purl == direct and dailyrec.is_discover_playlist_guid(pguid):
+            return pguid
+    # 正向表未命中：改用落盘索引按 coverUrl 反查
+    for pguid, meta in _DISCOVER_CARD_INDEX.items():
+        if not isinstance(meta, dict):
+            continue
+        if str(meta.get("coverUrl") or "") == direct and dailyrec.is_discover_playlist_guid(pguid):
+            return str(pguid)
+    return ""
+
+
 def _discover_cover_id(cover_url: str, playlist_guid: str) -> str:
     """歌单封面直链 → App 可用 coverId（`track_` + fake 32-hex），并登记反查。"""
     real = str(cover_url or "").strip() or str(playlist_guid or "")
@@ -7183,6 +7266,20 @@ def _load_discover_card_index() -> None:
     if _DISCOVER_CARD_INDEX:
         logger.info("discover: 从磁盘恢复 %d 张推荐歌单卡片元数据",
                     len(_DISCOVER_CARD_INDEX))
+        # 同步重建封面反查（重启后 _DISCOVER_COVER_REVERSE 是空的，而 App 会持
+        # 着重启前学到的 coverId 直接来取封面）。fake = fake_official_guid(直链)
+        # 是单向哈希，不 warm 就永远反解不出——必须在这里按卡片 coverUrl 重算。
+        warmed = 0
+        for guid, meta in _DISCOVER_CARD_INDEX.items():
+            cover = str(meta.get("coverUrl") or "").strip()
+            if not cover:
+                continue
+            fake = fake_official_guid(cover)
+            _DISCOVER_COVER_REVERSE.setdefault(fake, cover)
+            _DISCOVER_COVER_FORWARD.setdefault(str(guid), cover)
+            warmed += 1
+        if warmed:
+            logger.info("discover: 重建封面反查表 %d 条", warmed)
 
 
 def _save_discover_card_index() -> None:
