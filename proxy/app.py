@@ -668,6 +668,20 @@ def _env_watch_stat(path: "str | None" = None):
 # 音源集合相关的 CONF 键：任一变化意味着推荐缓存里的旧源曲目可能不可播（issue #22）
 _SOURCE_CONF_KEYS = {"musicdl_enabled", "netease_enabled", "lx_enabled", "online_sources", "lx_sources"}
 
+# 推荐歌单（discover）相关的 CONF 键：平台白名单/每分类条数/分类任一变化都必须
+# 立刻失效 _DISCOVER_CACHE，否则歌单列表要等 30 分钟 TTL 才更新（用户改了「每个
+# 分类 1 个/2 个」却看不到增减，就是这个缓存没失效）。
+_DISCOVER_CONF_KEYS = {
+    "recommend_playlist", "recommend_playlist_source",
+    "recommend_playlist_page_size", "recommend_playlist_category",
+}
+
+
+def _reset_discover_cache() -> None:
+    """清空推荐歌单卡片/曲目缓存（配置变化后立即重建）。"""
+    _DISCOVER_CACHE.clear()
+    _DISCOVER_TRACK_CACHE.clear()
+
 
 def _cancel_daily_tasks() -> None:
     for key in list(_DAILY_TASKS):
@@ -693,6 +707,14 @@ async def _env_watch_loop() -> None:
             changed = apply_env_hot_reload()
             if changed:
                 _reset_search_cache()
+                if _DISCOVER_CONF_KEYS & set(changed):
+                    # 推荐歌单配置变化（平台/分类/条数）→ 立即失效卡片与曲目缓存，
+                    # 下一次列表请求按新配置重建（不再等 30 分钟 TTL）。
+                    _reset_discover_cache()
+                    logger.info(
+                        "推荐歌单配置变化(%s)：已失效歌单卡片/曲目缓存",
+                        ",".join(sorted(_DISCOVER_CONF_KEYS & set(changed))),
+                    )
                 if _SOURCE_CONF_KEYS & set(changed):
                     # issue #22：切换音源后当日推荐立即失效，切回歌单按新音源重建，
                     # 旧源曲目不再残留到当日结束
@@ -7509,13 +7531,15 @@ async def _fetch_discover_cards(source: str) -> list[dict]:
     每个分类各取 page_size 条，跨分类按 pid 去重（同一歌单可能挂多个标签）。
     """
     cats = _discover_categories_for(source)
-    cache_key = source if not cats else f"{source}|{'~'.join(cats)}"
+    limit = int(CONF.get("recommend_playlist_page_size") or 12)
+    # cache_key 必须带上 limit（每分类条数）：用户只改「每个分类 1 个/2 个」时
+    # source 与 cats 都不变，若不带 limit 会命中旧缓存 → 歌单数不跟着变（bug）。
+    cache_key = f"{source}|{'~'.join(cats)}|{limit}"
     now = time.time()
     cached = _DISCOVER_CACHE.get(cache_key)
     if cached and now - cached[0] < _DISCOVER_CACHE_TTL_S:
         return cached[1]
     client = get_platform_client(app)
-    limit = int(CONF.get("recommend_playlist_page_size") or 12)
     async with _DISCOVER_LOCK:
         cached = _DISCOVER_CACHE.get(cache_key)
         if cached and time.time() - cached[0] < _DISCOVER_CACHE_TTL_S:

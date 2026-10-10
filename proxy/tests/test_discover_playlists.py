@@ -8,6 +8,7 @@
   - 开关关闭时零注入（不影响官方透传）
 """
 import os
+import time
 
 import httpx
 import pytest
@@ -662,3 +663,52 @@ def test_category_platforms_cover_expected():
     assert plpl.CATEGORY_GROUP_FALLBACK["mg"] == []
     for src in plpl.CATEGORY_PLATFORMS:
         assert plpl.CATEGORY_GROUP_FALLBACK[src], f"{src} 兜底表不应为空"
+
+
+def test_fetch_cards_cache_key_includes_page_size(monkeypatch):
+    """回归：改「每个分类 N 个」必须换缓存 key，否则歌单数不跟着变。
+
+    背景：cache_key 原为 `source|cats`，不含 limit。用户把每分类 2 个改成 1 个时
+    source 与 cats 都没变 → 命中旧缓存 → 歌单列表数量不变（用户报的 bug）。
+    """
+    calls = []
+
+    async def fake_cards(client, src, sort="hot", page=1, limit=30, category=""):
+        calls.append((category, limit))
+        return [{"id": f"{category}-1", "name": category, "author": "", "img": "",
+                 "play_count": "", "total": 1, "desc": "", "source": "wy"}]
+
+    monkeypatch.setattr(plpl, "fetch_platform_playlists", fake_cards)
+    monkeypatch.setitem(CONF, "recommend_playlist_category", "wy:古风")
+    appmod._DISCOVER_CACHE.clear()
+
+    import asyncio
+    monkeypatch.setitem(CONF, "recommend_playlist_page_size", 2)
+    first = asyncio.run(appmod._fetch_discover_cards("wy"))
+    assert calls == [("古风", 2)]
+
+    # 仅改每分类条数（分类不变）→ 必须重抓，而不是命中旧缓存
+    monkeypatch.setitem(CONF, "recommend_playlist_page_size", 1)
+    second = asyncio.run(appmod._fetch_discover_cards("wy"))
+    assert calls == [("古风", 2), ("古风", 1)], calls
+    assert len(first) == 1 and len(second) == 1
+    # 两个 key 并存
+    assert len(appmod._DISCOVER_CACHE) == 2
+    appmod._DISCOVER_CACHE.clear()
+
+
+def test_reset_discover_cache_clears_both_caches():
+    """_reset_discover_cache 必须同时清卡片与曲目缓存（热重载后立即重建）。"""
+    appmod._DISCOVER_CACHE["k"] = (time.time(), [])
+    appmod._DISCOVER_TRACK_CACHE["t"] = (time.time(), [])
+    appmod._reset_discover_cache()
+    assert appmod._DISCOVER_CACHE == {}
+    assert appmod._DISCOVER_TRACK_CACHE == {}
+
+
+def test_discover_conf_keys_cover_recommend_config():
+    """推荐歌单相关 CONF 键都要在失效白名单里，否则改了不生效。"""
+    assert {
+        "recommend_playlist", "recommend_playlist_source",
+        "recommend_playlist_page_size", "recommend_playlist_category",
+    } <= appmod._DISCOVER_CONF_KEYS
