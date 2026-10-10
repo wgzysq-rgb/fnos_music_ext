@@ -184,7 +184,25 @@ git pull
   1. 在 `.env` 里换主源：`FNMUSIC_PIP_INDEX` / `FNMUSIC_APT_MIRROR`；
   2. 自定义备用链：`FNMUSIC_PIP_FALLBACK_INDEXES` / `FNMUSIC_APT_FALLBACK_MIRRORS`（空格分隔，填镜像站根地址）；
   3. 给 Docker daemon 配代理（`/etc/docker/daemon.json` 的 `proxies` 段）后重试；
-  4. 运行 `sudo bash scripts/diagnose_install.sh` 采集只读诊断报告（含安装日志、DNS、容器内网络连通性），据此定位具体卡住的步骤。
+  4. 运行 `diagnose_install.sh` 采集只读诊断报告（含安装日志、DNS、容器内网络连通性），据此定位具体卡住的步骤——脚本位置见下一条。
+- **诊断脚本在哪里**：这些脚本随 fpk 一起装在**应用目录**里（不是 git 克隆的工作区）。不同 fnOS 版本的落点略有差异，先定位再运行：
+
+  ```bash
+  # 一步定位
+  sudo find /var/apps/fnmusic-ext -maxdepth 3 -name 'diagnose_*.sh'
+  ```
+
+  常见落点是 `/var/apps/fnmusic-ext/target/repo/scripts/`（也可能是 `/var/apps/fnmusic-ext/repo/scripts/`）：
+
+  ```bash
+  # 播放/取流/转码/边听边存/封面 一把梭（只读，不改任何状态）
+  sudo bash /var/apps/fnmusic-ext/target/repo/scripts/diagnose_playback.sh
+  # 安装/网络问题
+  sudo bash /var/apps/fnmusic-ext/target/repo/scripts/diagnose_install.sh
+  ```
+
+  报告写入 `/tmp/`（如 `/tmp/fnmusic-playback-diag-<时间戳>.txt`），把内容贴回即
+  可定位。用 git clone 脚本安装的话，脚本就在仓库的 `scripts/` 目录下。
 - **切源后内存没有变化**：切换在容器内完成，`docker stats fnmusic-sources` 稍等片刻后查看；未启用音源进程会被停止而非休眠。
 - **改了 `.env` 不生效**：热重载仅覆盖白名单键（音源开关/音质/推荐/边听边存/LLM 等）；路径、端口、平台白名单类改动需执行 `./extend.sh` 重启容器。
 
