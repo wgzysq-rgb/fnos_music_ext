@@ -4,10 +4,13 @@
 # 用途：定位「曲目能显示、但一点播放就跳到下一首」这类问题。
 # 全部为只读操作：不修改配置、不重启服务、不删任何文件。
 #
-# 用法：
-#   sudo bash scripts/diagnose_playback.sh
-#   sudo bash scripts/diagnose_playback.sh lx:wy:1415111009     # 附带一次直链解析测试
-#   sudo bash scripts/diagnose_playback.sh lx:tx:0039MnYb0qxYhV
+# 用法（应用中心 fpk 安装后在 NAS 上跑；脚本只读，不改任何状态）：
+#   sudo bash /var/apps/fnmusic-ext/target/repo/scripts/diagnose_playback.sh
+#   sudo bash /var/apps/fnmusic-ext/target/repo/scripts/diagnose_playback.sh lx:wy:1415111009
+#   sudo bash /var/apps/fnmusic-ext/target/repo/scripts/diagnose_playback.sh lx:tx:0039MnYb0qxYhV
+# git clone 方式安装时路径为 <仓库>/scripts/diagnose_playback.sh。
+# 注意 /var/apps/fnmusic-ext/target 是软链 → /vol1/@appcenter/fnmusic-ext，
+# 用 find 定位要加 -L（find 默认不跟随软链，会什么都搜不到）。
 #
 # 第二个参数（曲目 id）怎么拿：在飞牛音乐里打开出问题的推荐歌单，
 # 用浏览器开发者工具看 playlist 曲目列表请求的返回，条目里 `id` 字段

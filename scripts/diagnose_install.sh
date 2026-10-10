@@ -1,6 +1,7 @@
 #!/bin/bash
 # fnmusic-ext 安装失败诊断采集（只读，不修改任何系统状态、不输出任何密钥）
-# 用法: sudo bash scripts/diagnose_install.sh
+# 用法: sudo bash /var/apps/fnmusic-ext/target/repo/scripts/diagnose_install.sh
+#       （target 是软链 → /vol1/@appcenter/fnmusic-ext；git clone 安装则为 <仓库>/scripts/）
 # 输出：终端打印 + 生成 /tmp/fnmusic-diag-<时间戳>.txt
 # 把该文件内容贴回即可。
 

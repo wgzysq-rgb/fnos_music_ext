@@ -185,20 +185,20 @@ git pull
   2. 自定义备用链：`FNMUSIC_PIP_FALLBACK_INDEXES` / `FNMUSIC_APT_FALLBACK_MIRRORS`（空格分隔，填镜像站根地址）；
   3. 给 Docker daemon 配代理（`/etc/docker/daemon.json` 的 `proxies` 段）后重试；
   4. 运行 `diagnose_install.sh` 采集只读诊断报告（含安装日志、DNS、容器内网络连通性），据此定位具体卡住的步骤——脚本位置见下一条。
-- **诊断脚本在哪里**：这些脚本随 fpk 一起装在**应用目录**里（不是 git 克隆的工作区）。不同 fnOS 版本的落点略有差异，先定位再运行：
-
-  ```bash
-  # 一步定位（不要加 -maxdepth 限制：脚本可能在 target/repo/scripts 这类更深一层）
-  sudo find /var/apps/fnmusic-ext -name 'diagnose_*.sh'
-  ```
-
-  常见落点是 `/var/apps/fnmusic-ext/target/repo/scripts/`（也可能是 `/var/apps/fnmusic-ext/repo/scripts/`）：
+- **诊断脚本在哪里**：这些脚本随 fpk 一起装在**应用目录**里（不是 git 克隆的工作区）。安装后的固定落点：
 
   ```bash
   # 播放/取流/转码/边听边存/封面 一把梭（只读，不改任何状态）
   sudo bash /var/apps/fnmusic-ext/target/repo/scripts/diagnose_playback.sh
   # 安装/网络问题
   sudo bash /var/apps/fnmusic-ext/target/repo/scripts/diagnose_install.sh
+  ```
+
+  其中 `target` 是软链，指向真实目录 `/vol1/@appcenter/fnmusic-ext`，两个路径等价。
+  **注意 `find` 默认不跟随软链**，找不到时用 `-L`：
+
+  ```bash
+  sudo find -L /var/apps/fnmusic-ext -name 'diagnose_*.sh'
   ```
 
   报告写入 `/tmp/`（如 `/tmp/fnmusic-playback-diag-<时间戳>.txt`），把内容贴回即
