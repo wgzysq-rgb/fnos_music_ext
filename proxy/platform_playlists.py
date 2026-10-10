@@ -278,16 +278,28 @@ def _song(source: str, sid: str, title: str, artist: str = "", album: str = "",
 
 # --------------------------------------------------------------- 推荐歌单广场 --
 
-async def _tx_recommend(client: httpx.AsyncClient, sort: str, page: int, limit: int) -> list[dict]:
+async def _tx_recommend(client: httpx.AsyncClient, sort: str, page: int, limit: int,
+                        category: str = "") -> list[dict]:
+    """QQ 歌单广场。
+
+    统一走 `get_playlist_by_tag`：它的 `id` 参数**就是**分类 id（`10000000` = 全部），
+    传 `id=<分类id>` 即按该分类过滤。实测 total 随分类变化（国语 4812、流行 5325、
+    民谣 830…），内容与分类名一致。
+
+    注意（v2.8.3 修正）：早前误用 `get_playlist_by_category` —— 该 method 的 `id`/
+    `titleid` **不参与分类过滤**，恒返回一个与分类无关的固定小集合（total=9，多为
+    「音乐节」类歌单），导致「选国语却出日本音乐节」。**勿再改回该 method。**
+    """
     order = 2 if sort == "new" else 5
+    cat = str(category or "").strip()
+    tag_id = int(cat) if (cat.isdigit() and cat != "10000000") else 10000000
+    method = "get_playlist_by_tag"
+    param = {"id": tag_id, "sin": limit * (page - 1), "size": limit,
+             "order": order, "cur_page": page}
     payload = {
         "comm": {"cv": 1602, "ct": 20},
-        "playlist": {
-            "method": "get_playlist_by_tag",
-            "param": {"id": 10000000, "sin": limit * (page - 1), "size": limit,
-                      "order": order, "cur_page": page},
-            "module": "playlist.PlayListPlazaServer",
-        },
+        "playlist": {"method": method, "param": param,
+                     "module": "playlist.PlayListPlazaServer"},
     }
     url = ("https://u.y.qq.com/cgi-bin/musicu.fcg?format=json&data="
            + quote(json.dumps(payload, ensure_ascii=False), safe=""))

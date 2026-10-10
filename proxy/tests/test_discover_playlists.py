@@ -531,3 +531,124 @@ def test_generic_name_only_when_card_never_fetched(monkeypatch):
     from proxy.app import _discover_detail_record
     rec = _discover_detail_record(DISCOVER_GUID, "wy", "PLID1", 0)
     assert rec["name"] == "网易云推荐歌单"
+
+
+# --------------------------------------------------------- 分类筛选（2.8.0） --
+
+def test_discover_categories_for_parses_csv(monkeypatch):
+    """FNMUSIC_RECOMMEND_PLAYLIST_CATEGORY 解析：按平台过滤、去重、忽略脏值。"""
+    monkeypatch.setitem(CONF, "recommend_playlist_category",
+                        "tx:11, tx:194 ,kg:12,wy:古风,xinhao,bad:,tx:11")
+    assert appmod._discover_categories_for("tx") == ["11", "194"]
+    assert appmod._discover_categories_for("kg") == ["12"]
+    assert appmod._discover_categories_for("wy") == ["古风"]
+    assert appmod._discover_categories_for("kw") == []
+    # 空配置 = 无分类（走「全部」，与原行为一致）
+    monkeypatch.setitem(CONF, "recommend_playlist_category", "")
+    assert appmod._discover_categories_for("tx") == []
+
+
+def test_fetch_cards_per_category_merges_and_dedupes(monkeypatch):
+    """勾选多个分类时：逐分类抓取 → 合并 → 按 pid 去重。
+
+    上游可能把同一张歌单挂在多个标签下，这里必须去重否则列表出现重复卡片。
+    """
+    seen_cats = []
+
+    async def fake_cards(client, src, sort="hot", page=1, limit=30, category=""):
+        seen_cats.append(category)
+        if category == "11":
+            return [{"id": "A", "name": "摇滚A", "author": "", "img": "", "play_count": "",
+                     "total": 1, "desc": "", "source": "tx"}]
+        if category == "194":
+            # 故意含一张与 "11" 重复的 A，验证去重
+            return [{"id": "A", "name": "摇滚A", "author": "", "img": "", "play_count": "",
+                     "total": 1, "desc": "", "source": "tx"},
+                    {"id": "B", "name": "古风B", "author": "", "img": "", "play_count": "",
+                     "total": 1, "desc": "", "source": "tx"}]
+        return []
+
+    monkeypatch.setattr(plpl, "fetch_platform_playlists", fake_cards)
+    monkeypatch.setitem(CONF, "recommend_playlist_category", "tx:11,tx:194")
+
+    import asyncio
+    cards = asyncio.run(appmod._fetch_discover_cards("tx"))
+    assert seen_cats == ["11", "194"]
+    assert [c["id"] for c in cards] == ["A", "B"]
+
+
+def test_fetch_cards_no_category_uses_plain_fetch(monkeypatch):
+    """未配置分类时必须走原路径（category 传空串），保证零行为变化。"""
+    calls = []
+
+    async def fake_cards(client, src, sort="hot", page=1, limit=30, category=""):
+        calls.append(category)
+        return [{"id": "X", "name": "X", "author": "", "img": "", "play_count": "",
+                 "total": 1, "desc": "", "source": "tx"}]
+
+    monkeypatch.setattr(plpl, "fetch_platform_playlists", fake_cards)
+    monkeypatch.setitem(CONF, "recommend_playlist_category", "")
+    import asyncio
+    cards = asyncio.run(appmod._fetch_discover_cards("tx"))
+    assert calls == [""]
+    assert [c["id"] for c in cards] == ["X"]
+
+
+def test_tx_recommend_uses_tag_method_with_category_id(monkeypatch):
+    """回归（v2.8.3）：tx 必须走 get_playlist_by_tag 且把分类 id 放进 param.id。
+
+    背景：早前误用 get_playlist_by_category —— 该 method 的 id/titleid **不参与分类
+    过滤**，恒返回一个与分类无关的固定小集合（实测 total=9，多为「音乐节」歌单），
+    导致用户「选国语却出现日本/新奥尔良音乐节」。
+    正确做法：get_playlist_by_tag + id=<分类id>（实测 total 随分类变化：
+    国语 4812、流行 5325、民谣 830），空分类则 id=10000000（全部）。
+    """
+    captured = {}
+
+    async def fake_get(client, url, headers, **kw):
+        captured["url"] = url
+        return {"playlist": {"data": {"v_playlist": []}}}
+
+    monkeypatch.setattr(plpl, "_get", fake_get)
+    import asyncio
+    from urllib.parse import unquote
+
+    # 指定分类：必须是 by_tag + id=165
+    asyncio.run(plpl._tx_recommend(None, "hot", 1, 10, "165"))
+    url = unquote(captured["url"])
+    assert "get_playlist_by_tag" in url, f"应走 by_tag，实际 {url}"
+    assert "get_playlist_by_category" not in url, f"不得再回退到 by_category：{url}"
+    assert '"id": 165' in url, f"分类 id 必须进 param.id：{url}"
+
+    # 空分类：仍走 by_tag，id=10000000（全部）
+    asyncio.run(plpl._tx_recommend(None, "hot", 1, 10, ""))
+    url2 = unquote(captured["url"])
+    assert "get_playlist_by_tag" in url2
+    assert '"id": 10000000' in url2, f"空分类应为全部：{url2}"
+
+    # 非数字分类：不得丢给 int() 崩，应退化为全部
+    asyncio.run(plpl._tx_recommend(None, "hot", 1, 10, "abc"))
+    url3 = unquote(captured["url"])
+    assert "get_playlist_by_tag" in url3 and '"id": 10000000' in url3, url3
+
+
+def test_fetch_platform_categories_fallback(monkeypatch):
+    """上游分类接口失败时必须回落内置兜底表，绝不返回空（否则 UI 分类区消失）。"""
+    async def boom(client, source):
+        raise RuntimeError("upstream down")
+
+    monkeypatch.setattr(plpl, "_tx_categories", boom)
+    import asyncio
+    cats = asyncio.run(plpl.fetch_platform_categories(None, "tx"))
+    assert cats and all({"id", "name", "group"} <= set(c) for c in cats)
+    # 不支持分类的平台直接返回空
+    assert asyncio.run(plpl.fetch_platform_categories(None, "mg")) == []
+    assert asyncio.run(plpl.fetch_platform_categories(None, "nope")) == []
+
+
+def test_category_platforms_cover_expected():
+    """分类支持范围：tx/wy/kw/kg 有，mg 没有（咪咕无分类体系）。"""
+    assert set(plpl.CATEGORY_PLATFORMS) == {"tx", "wy", "kw", "kg"}
+    assert plpl.CATEGORY_GROUP_FALLBACK["mg"] == []
+    for src in plpl.CATEGORY_PLATFORMS:
+        assert plpl.CATEGORY_GROUP_FALLBACK[src], f"{src} 兜底表不应为空"
