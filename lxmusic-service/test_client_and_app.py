@@ -6,6 +6,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
+import os
 
 import httpx
 import pytest
@@ -233,6 +235,8 @@ def test_source_management_endpoints(test_app_client, fake_lx):
     assert res.json()["ok"] is True
 
 
+@pytest.mark.skipif(os.name != "posix",
+                    reason="file:// 本地路径补导入依赖 POSIX 绝对路径（Windows 下 urlparse 会把盘符并进 path）")
 def test_source_set_activates_unknown_local_file_by_import(test_app_client, fake_lx, tmp_path):
     """旧数据卷路径（如 /data/lxmusic/uploads）不在 lxserver 列表时自动补导入再激活。"""
     script_path = tmp_path / "legacy_src.js"
@@ -409,4 +413,114 @@ def test_source_capabilities_reflects_failed_status():
     finally:
         lxapp.LXSERVER = orig_lx
 
+# ------------------------------------------- 历史数据迁移自举（pathlib 回归） --
 
+def test_bootstrap_migration_has_pathlib_imported():
+    """_bootstrap_migration 用 pathlib.Path。
+
+    真机日志曾长期只报「历史数据检查与迁移异常: name 'Path' is not defined」，
+    整个历史音源迁移/自动激活被一句 except 静默吞掉。
+    """
+    assert lxapp.Path is not None
+
+
+async def _forbidden_source_set(body):
+    raise AssertionError("不该调用 source_set：%s" % body.url)
+
+
+class _ReadyClient:
+    """只为迁移自举提供 is_alive / 列表能力的替身（不碰网络）。"""
+
+    def __init__(self, sources=None, uploads=None):
+        self.sources = list(sources or [])
+        self.uploads = uploads
+        self.alive_calls = 0
+        self.list_calls = 0
+
+    async def is_alive(self):
+        self.alive_calls += 1
+        return True
+
+    async def list_custom_sources(self):
+        self.list_calls += 1
+        return self.sources
+
+    async def upload_custom_source(self, filename, content):
+        if self.uploads is not None:
+            self.uploads.append((filename, content))
+        return {"success": True}
+
+
+def test_bootstrap_migration_runs_clean_on_empty_env(monkeypatch, caplog, tmp_path):
+    """空环境（无历史目录/无历史音源）跑完不得报异常，且确实探活过 lxserver。"""
+    fake = _ReadyClient()
+    monkeypatch.setenv("LX_DATA_DIR", str(tmp_path / "no-such-legacy"))
+    monkeypatch.delenv("LX_SOURCE_URL", raising=False)
+    monkeypatch.setattr(lxapp, "LXSERVER", fake)
+
+    with caplog.at_level(logging.WARNING):
+        asyncio.run(lxapp._bootstrap_migration())
+
+    assert fake.alive_calls >= 1
+    assert "历史数据检查与迁移异常" not in caplog.text
+    assert "is not defined" not in caplog.text
+
+
+def test_bootstrap_migration_uploads_legacy_scripts(monkeypatch, tmp_path):
+    """历史 uploads/*.js 必须被迁移上传；已在源列表里的同名脚本跳过。"""
+    legacy = tmp_path / "legacy"
+    (legacy / "uploads").mkdir(parents=True)
+    (legacy / "uploads" / "ikun.js").write_text("/*! @name ikun */", encoding="utf-8")
+    (legacy / "uploads" / "old.js").write_text("/*! @name old */", encoding="utf-8")
+
+    uploaded: list[tuple[str, str]] = []
+    fake = _ReadyClient(sources=[{"id": "old.js", "name": "old", "enabled": False}],
+                        uploads=uploaded)
+    monkeypatch.setenv("LX_DATA_DIR", str(legacy))
+    monkeypatch.delenv("LX_SOURCE_URL", raising=False)
+    monkeypatch.setattr(lxapp, "LXSERVER", fake)
+    monkeypatch.setattr(lxapp, "source_set", _forbidden_source_set)
+
+    asyncio.run(lxapp._bootstrap_migration())
+
+    assert [name for name, _ in uploaded] == ["ikun.js"]
+
+
+def test_bootstrap_migration_reactivates_legacy_source(monkeypatch, tmp_path):
+    """没有任何源的场景下，历史 state.json 的 source_url 必须被自动激活。"""
+    legacy = tmp_path / "legacy"
+    legacy.mkdir(parents=True)
+    (legacy / "state.json").write_text(
+        json.dumps({"source_url": "https://example.test/src.js"}), encoding="utf-8")
+
+    activated: list[str] = []
+
+    async def fake_source_set(body):
+        activated.append(body.url)
+        return {"success": True}
+
+    fake = _ReadyClient()
+    monkeypatch.setenv("LX_DATA_DIR", str(legacy))
+    monkeypatch.delenv("LX_SOURCE_URL", raising=False)
+    monkeypatch.setattr(lxapp, "LXSERVER", fake)
+    monkeypatch.setattr(lxapp, "source_set", fake_source_set)
+
+    asyncio.run(lxapp._bootstrap_migration())
+
+    assert activated == ["https://example.test/src.js"]
+
+
+def test_bootstrap_migration_keeps_existing_active_source(monkeypatch, tmp_path):
+    """已有激活源时不得用历史 state.json 覆盖用户当前选择。"""
+    legacy = tmp_path / "legacy"
+    legacy.mkdir(parents=True)
+    (legacy / "state.json").write_text(
+        json.dumps({"source_url": "https://example.test/stale.js"}), encoding="utf-8")
+
+    fake = _ReadyClient(sources=[{"id": "cur.js", "name": "cur", "enabled": True}])
+    monkeypatch.setenv("LX_DATA_DIR", str(legacy))
+    monkeypatch.delenv("LX_SOURCE_URL", raising=False)
+    monkeypatch.setattr(lxapp, "LXSERVER", fake)
+    monkeypatch.setattr(lxapp, "source_set", _forbidden_source_set)
+
+    asyncio.run(lxapp._bootstrap_migration())

@@ -122,6 +122,9 @@ CONF = {
     # 封面探针：记录每条 /static/cover 请求命中的分支与最终产物（含歌单封面
     # 为何退到占位图/404），用于真机定位"某个列表没封面"。默认开
     "cover_probe": os.environ.get("FNMUSIC_COVER_PROBE", "true").lower() in ("true", "1", "yes"),
+    # 飞牛音乐曲库 db。默认值是「官方音乐 App 容器内视角」的路径：应用中心
+    # fpk 形态下代理跑在 NAS 宿主机上，这个路径在宿主机上通常不存在，因此
+    # 配置值落空时会按宿主机目录布局再探测一遍（见 _LIBRARY_DB_PATTERNS）。
     "music_db": os.environ.get(
         "FNMUSIC_MUSIC_DB", "/usr/local/apps/@appdata/trim.music/db/music.db"
     ),
@@ -1534,48 +1537,116 @@ def embed_audio_cover(path: str, data: bytes, mime: str) -> bool:
 
 
 _LIBRARY_FALLBACK_WARNED = False
+_MUSIC_DB_RESOLVED_LOGGED = False
+
+# 宿主机（应用中心 fpk）形态下代理跑在 NAS 宿主 systemd 里，而 music_db 的
+# 默认值是官方音乐 App 的「容器内视角」路径，宿主机上并不存在。此时若直接
+# 回落 cache 目录，边听边存仍然会落盘，但文件名是哈希、不进官方曲库——用户
+# 看到的就是「边听边存彻底失效、不知道歌存哪了」。所以配置值落空时按飞牛
+# 真实目录布局（数据目录在 /volN/@appdata/<appname>）再找一遍。
+_LIBRARY_DB_PATTERNS = (
+    "/vol*/@appdata/trim.music/db/music.db",
+    "/usr/local/apps/@appdata/trim.music/db/music.db",
+    "/vol*/@appdata/trim.music/db/*.db",
+)
+
+
+def iter_music_db_candidates() -> list[str]:
+    """候选 music.db：配置值优先，其后是按宿主机目录布局探测到的实际文件。"""
+    candidates: list[str] = []
+    configured = str(CONF.get("music_db") or "").strip()
+    if configured:
+        candidates.append(configured)
+    for pattern in _LIBRARY_DB_PATTERNS:
+        for found in sorted(glob.glob(pattern)):
+            if found not in candidates:
+                candidates.append(found)
+    return [c for c in candidates if os.path.isfile(c)]
+
+
+def _shared_library_paths(db: str) -> list[str]:
+    """只读打开 music.db 取共享库路径列表（表缺失/无权限由调用方处理）。"""
+    con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    try:
+        rows = con.execute("SELECT path FROM shared_library ORDER BY id").fetchall()
+    finally:
+        con.close()
+    return [str(r[0]) for r in rows if r and r[0]]
+
+
+_MUSIC_DB_CACHE: "str | None" = None
+
+
+def resolve_music_db() -> str:
+    """当前可用的 music.db 路径：配置值可用即用，否则用宿主机布局探测结果。
+
+    官方曲库反查（official_track_guid_by_tags / library_file_by_tags）也用这个，
+    否则宿主机部署下这两处会因为默认路径不存在而直接放弃。
+    都不可用时返回配置值，由调用方自行判存在。
+    """
+    global _MUSIC_DB_CACHE
+    configured = str(CONF.get("music_db") or "").strip()
+    if configured and os.path.isfile(configured):
+        return configured
+    if _MUSIC_DB_CACHE and os.path.isfile(_MUSIC_DB_CACHE):
+        return _MUSIC_DB_CACHE
+    candidates = iter_music_db_candidates()
+    if candidates:
+        _MUSIC_DB_CACHE = candidates[0]
+        return candidates[0]
+    return configured
 
 
 def detect_library_dir() -> str:
     """优先环境变量，否则读飞牛 music.db 的共享库路径，最后回退到仓库 cache/。"""
+    global _LIBRARY_FALLBACK_WARNED, _MUSIC_DB_RESOLVED_LOGGED
     explicit = str(CONF.get("library_dir") or "").strip()
     if explicit:
         return explicit
-    db = str(CONF.get("music_db") or "")
-    if db and os.path.exists(db):
+    configured = str(CONF.get("music_db") or "").strip()
+    candidates = iter_music_db_candidates()
+    saw_rows = False
+    for db in candidates:
         try:
-            con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
-            try:
-                rows = con.execute("SELECT path FROM shared_library ORDER BY id").fetchall()
-            finally:
-                con.close()
-            for (path,) in rows:
-                if path and os.path.isdir(path):
-                    return path
-            if rows:
-                logger.warning(
-                    "shared_library 里有 %d 条路径但均不存在/不可访问：%s",
-                    len(rows), [r[0] for r in rows],
-                )
+            rows = _shared_library_paths(db)
         except Exception as e:
-            logger.warning("Failed to read shared_library path: %s", e)
+            logger.warning("Failed to read shared_library path (%s): %s", db, e)
+            continue
+        if rows:
+            saw_rows = True
+        for path in rows:
+            if os.path.isdir(path):
+                if db != configured and not _MUSIC_DB_RESOLVED_LOGGED:
+                    _MUSIC_DB_RESOLVED_LOGGED = True
+                    logger.info(
+                        "曲库自动探测命中：music.db=%s（配置的 %s 在宿主机上不存在），"
+                        "边听边存将落盘到 %s；可在 .env 用 FNMUSIC_MUSIC_DB 固定该路径。",
+                        db, configured or "<默认>", path,
+                    )
+                return path
+        if rows:
+            logger.warning(
+                "shared_library 里有 %d 条路径但均不存在/不可访问（%s）：%s",
+                len(rows), db, rows,
+            )
     # 回落 cache/ 是用户最难自查的静默降级：文件仍然落盘，但文件名是
     # 哈希、不在官方曲库里，看起来就像「边听边存失效」。必须显著留痕。
-    global _LIBRARY_FALLBACK_WARNED
     if not _LIBRARY_FALLBACK_WARNED:
         _LIBRARY_FALLBACK_WARNED = True
-        if db and not os.path.exists(db):
+        if not candidates:
             logger.warning(
-                "曲库探测失败：music.db 不存在（%s）。边听边存将落到 cache 目录（%s），"
-                "文件不进官方曲库！若 fnOS 升级/曲库迁移过，请在 .env 设置 "
-                "FNMUSIC_MUSIC_DB 或 FNMUSIC_LIBRARY_DIR 指向真实曲库。",
-                db, CONF["cache_dir"],
+                "曲库探测失败：music.db 不存在（配置值 %s，按宿主机布局 %s 也未命中）。"
+                "边听边存将落到 cache 目录（%s），文件不进官方曲库！请在 .env 设置 "
+                "FNMUSIC_MUSIC_DB（宿主机上形如 /vol1/@appdata/trim.music/db/music.db）"
+                "或 FNMUSIC_LIBRARY_DIR 指向真实曲库。",
+                configured or "<默认>", "、".join(_LIBRARY_DB_PATTERNS), CONF["cache_dir"],
             )
         else:
             logger.warning(
-                "曲库探测失败：shared_library 无可用路径。边听边存将落到 cache 目录（%s），"
-                "文件不进官方曲库！请在 .env 设置 FNMUSIC_LIBRARY_DIR 指向真实曲库。",
-                CONF["cache_dir"],
+                "曲库探测失败：已试 %s，shared_library 无可用路径。边听边存将落到 "
+                "cache 目录（%s），文件不进官方曲库！请在 .env 设置 "
+                "FNMUSIC_LIBRARY_DIR 指向真实曲库。",
+                candidates, CONF["cache_dir"],
             )
     return CONF["cache_dir"]
 
@@ -3104,6 +3175,10 @@ async def lifespan(fastapi_app: FastAPI):
     for k, v in CONF.items():
         logger.info("  %s = %s", k, _conf_log_value(k, v))
     logger.info("  llm_enabled = %s", dailyrec.llm_enabled())
+    # 曲库/落盘目录解析结果单独留一行：tee 只在播放在线曲目时才触发，出问题时
+    # 用户只要看一眼启动日志就知道「边听边存会落到哪」，不必等第一次播放。
+    logger.info("  [自检] 曲库目录 = %s", detect_library_dir())
+    logger.info("  [自检] 边听边存落盘目录 = %s", tee_save_dir())
     logger.info("==================================")
 
     sweeper_task = asyncio.create_task(_lyric_orphan_sweeper()) if _background_jobs_enabled() else None
@@ -4730,8 +4805,8 @@ def official_track_guid_by_tags(title: str, artist: str, album: str = "") -> "st
     album_s = (album or "").strip()
     if not title_s or not artist_s:
         return None
-    db = str(CONF.get("music_db") or "")
-    if not db or not os.path.exists(db):
+    db = resolve_music_db()
+    if not db or not os.path.isfile(db):
         return None
     try:
         con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
@@ -4779,8 +4854,8 @@ def library_file_by_tags(title: str, artist: str, album: str = "") -> "str | Non
     album_s = (album or "").strip()
     if not title_s or not artist_s:
         return None
-    db = str(CONF.get("music_db") or "")
-    if not db or not os.path.exists(db):
+    db = resolve_music_db()
+    if not db or not os.path.isfile(db):
         return None
     try:
         con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)

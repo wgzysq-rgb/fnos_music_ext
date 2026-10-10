@@ -143,6 +143,7 @@ curl -s --unix-socket /var/run/trim_music.socket http://localhost/_ext/healthz
 | `FNMUSIC_ONLINE_SOURCES` / `MUSICDL_SOURCES` | 酷我+咪咕 | musicdl 平台白名单（短名/全名均可） |
 | `FNMUSIC_QUALITY_MODE` | `high` | 音质偏好：`high` / `balanced` / `smooth`（热重载） |
 | `FNMUSIC_TEE_SAVE_ENABLED` | `true` | 边听边存开关；`FNMUSIC_TEE_SAVE_DIR` 留空自动探测飞牛共享曲库 |
+| `FNMUSIC_MUSIC_DB` | *(容器内视角默认路径)* | 飞牛音乐曲库 db 路径。**应用中心（fpk）安装时代理跑在 NAS 宿主机上**，默认值 `/usr/local/apps/@appdata/trim.music/db/music.db` 在宿主机上不存在 → 会自动按 `/vol*/@appdata/trim.music/db/` 探测并留痕（`曲库自动探测命中：music.db=...`）；仍探测不到就显式写 `/vol1/@appdata/trim.music/db/music.db`（重启生效）。也可用 `FNMUSIC_LIBRARY_DIR` 直接指定共享曲库目录 |
 | `FNMUSIC_TEE_CACHE_MAX` | `2` | 关闭边听边存时滚动保留的试听缓存条数（仅关闭时生效） |
 | `FNMUSIC_TRANSCODE_ENABLED` | `true` | App 音质偏好为"标准"时在线歌曲由 ffmpeg 实时转码 AAC 分片流播放（热重载）；配套 `FNMUSIC_TRANSCODE_BITRATE`（128k）、`_HLS_TIME`（10 秒/片）、`_MAX_SESSIONS`（并发 2）、`_TTL_S`（停止心跳 90 秒后回收）、`_CACHE_MAX_MB`（转码缓存 512MB，最久未用先清）、`_DL_BITRATE`（转码下载标准档 320k，与官方一致） |
 | `FNMUSIC_AUTO_COVER` | `true` | 自动下载封面：落库歌曲自动内嵌源站封面，官方 App 显示封面图（热重载） |
@@ -203,6 +204,24 @@ git pull
 
   报告写入 `/tmp/`（如 `/tmp/fnmusic-playback-diag-<时间戳>.txt`），把内容贴回即
   可定位。用 git clone 脚本安装的话，脚本就在仓库的 `scripts/` 目录下。
+
+  报告里**代理日志**取自 `journalctl -u fnmusic-ext`（取流探针 `stream probe`、
+  边听边存 `tee finalize done`、封面探针 `cover probe` / `playlist cover` 全在这里），
+  容器日志另列一节（音源解析、转码、历史迁移）。
+
+  > **升级后请先「播一首在线歌 + 打开一个歌单列表」再跑脚本**：探针只在真的发生
+  > 请求时才写日志，没重放操作的话那些段落是空的，无法判断新版本修好了没有。
+- **边听边存找不到歌 / 曲库探测失败**：边听边存默认落盘到飞牛音乐共享曲库；探测不到时会退到 `<应用目录>/repo/cache`，**文件名是哈希、不进官方曲库**，所以在飞牛音乐里一首也找不到（看起来就是"边听边存彻底失效"）。2.7.9 起：
+  1. 启动日志会打印两行自检，直接告诉你文件落在哪：
+     ```bash
+     sudo journalctl -u fnmusic-ext | grep '\[自检\]'
+     #   [自检] 曲库目录 = /vol1/...
+     #   [自检] 边听边存落盘目录 = /vol1/...   ← 边听边存的文件就在这里
+     ```
+     第二行等于 cache 目录就说明曲库探测失败了。
+  2. 配置的 `music.db` 不存在时会自动按宿主机布局探测（`/vol*/@appdata/trim.music/db/music.db`），命中会打 `曲库自动探测命中：music.db=...`。
+  3. 仍探测不到就在 `.env` 显式写死宿主机视角路径：`FNMUSIC_MUSIC_DB=/vol1/@appdata/trim.music/db/music.db`，或直接 `FNMUSIC_LIBRARY_DIR=/vol1/<你的音乐共享目录>`，然后重启应用。
+  > 日志要看两处：**代理**跑在 NAS 宿主机上（`journalctl -u fnmusic-ext`，取流/边听边存/封面探针都在这里），**音源**跑在容器里（`docker logs fnmusic-sources`）。容器内 `docker exec ... env` 看不到 `FNMUSIC_*` 是正常的（compose 没有 `env_file`，容器内读的是挂载进来的 `/repo/.env`）。
 - **切源后内存没有变化**：切换在容器内完成，`docker stats fnmusic-sources` 稍等片刻后查看；未启用音源进程会被停止而非休眠。
 - **改了 `.env` 不生效**：热重载仅覆盖白名单键（音源开关/音质/推荐/边听边存/LLM 等）；路径、端口、平台白名单类改动需执行 `./extend.sh` 重启容器。
 

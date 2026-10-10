@@ -16,6 +16,7 @@ from contextvars import ContextVar
 import json
 import logging
 import os
+from pathlib import Path
 import re
 import time
 from typing import Any
@@ -39,7 +40,7 @@ from lxserver_client import (
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger("fnmusic.lxmusic")
 
-SERVICE_VERSION = "2.7.8"
+SERVICE_VERSION = "2.7.9"
 UA_PC = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
 
 # 配置字典
@@ -595,9 +596,11 @@ async def describe_user_source() -> dict:
 # ------------------------------------------------------------- FastAPI 生命周期 --
 
 async def _bootstrap_migration():
+    # 等 lxserver 起来再迁移：客户端只有 is_alive()（曾经误写成不存在的
+    # health()，异常被吞掉 → 白等 10 秒且根本没等就绪）
     for _ in range(20):
         try:
-            if await LXSERVER.health():
+            if await LXSERVER.is_alive():
                 break
         except Exception:
             pass

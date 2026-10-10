@@ -5,6 +5,71 @@
 
 ## [Unreleased]
 
+## [2.7.9] - 2026-10-10
+
+### 修复
+
+- **曲库探测在应用中心（fpk）安装形态下必然失败 → 边听边存"看起来彻底失效"**：
+  `FNMUSIC_MUSIC_DB` 的默认值 `/usr/local/apps/@appdata/trim.music/db/music.db`
+  是官方音乐 App 的**容器内视角**路径。fpk 形态下拦截代理跑在 NAS **宿主机**的
+  systemd 服务里，这个路径在宿主机上并不存在 → `detect_library_dir()` 静默回落到
+  `cache` 目录：文件其实落了盘，但**文件名是哈希、不进官方曲库**，用户在飞牛音乐
+  里当然一首也找不到。修复：
+  - 配置的 `music.db` 落空时，按飞牛真实目录布局再探测一遍
+    （`/vol*/@appdata/trim.music/db/music.db`、
+    `/usr/local/apps/@appdata/trim.music/db/music.db`、
+    `/vol*/@appdata/trim.music/db/*.db`），命中即用并打 INFO 留痕
+    （`曲库自动探测命中：music.db=...`）；多个候选逐个尝试，某个候选表缺失或
+    db 文件是坏的时候不会中断后续候选；
+  - 官方曲库反查（`official_track_guid_by_tags` / `library_file_by_tags`）同样改走
+    `resolve_music_db()`，否则这两条链在宿主机部署下会因为默认路径不存在而直接放弃；
+  - **启动日志新增自检两行**：`[自检] 曲库目录 = ...` 与
+    `[自检] 边听边存落盘目录 = ...`。tee 只在播放在线曲目时才触发，出问题时用户
+    现在只要看一眼启动日志就知道文件会落到哪，不必等第一次播放。
+- **洛雪源历史数据迁移自举彻底失效**：`lxmusic-service/app.py` 的
+  `_bootstrap_migration()` 用了 `pathlib.Path` 却从未导入，真机日志里长期只有一句
+  `历史数据检查与迁移异常: name 'Path' is not defined` —— 历史自定义源脚本迁移、
+  历史音源自动激活**全被这一句 except 吞掉**。已补导入。
+- 同一函数还误调用了不存在的 `LXSERVER.health()`（客户端只有 `is_alive()`）：
+  异常被吞掉 → 白等 20×0.5s 且**根本没有等 lxserver 就绪**就开始迁移。改回
+  `is_alive()`。
+
+### 变更
+
+- **`scripts/diagnose_playback.sh` 重写日志与配置来源（重要）**：此前脚本只读
+  `docker logs fnmusic-sources`，而 `stream probe`（取流探针）、`tee finalize done`
+  （边听边存落盘）、`cover probe` / `playlist cover`（封面）这些行全部由**宿主机上
+  的代理**写出、进的是 **systemd journal** —— 只看容器日志永远抓不到，这直接导致
+  了"升级后看不到任何探针行、无法判断修没修好"的误判。现在：
+  - 新增第 1 节「宿主机代理服务与端口」（`systemctl is-active/show/status` +
+    `ss -ltnp` 看 8768/8770/8772/8774）；
+  - 新增第 2 节「宿主机 repo/.env」：打印代理真正读取的那份配置（只打白名单键值
+    与键名，不打印可能含账号/token 的值），并明确说明
+    **`docker exec ... env` 看不到 `FNMUSIC_*` 是正常的**（compose 没有
+    `env_file`，容器内是从挂载进来的 `/repo/.env` 读开关）；
+  - 第 2b 节改为宿主机侧探测：列出 `/vol*/@appdata/` 下 trim/music 相关项、逐个判断
+    候选 `music.db`、用 `sqlite3`（无则 `python3`）读 `shared_library` 并标注每条
+    路径是否可用、列出宿主机侧落盘候选目录与封面缓存规模；
+  - 第 5 节拆成 5a（启动配置与曲库自检）/ 5b（边听边存）/ 5c（封面）/ 5d（告警），
+    全部取自 journal；容器侧日志移到第 6 节并注明"这里不会有 tee/cover probe"；
+  - 报告末尾新增第 9 节「怎么读这份报告」：按"一点就跳下一首 / 边听边存失效 /
+    列表没有封面"三种症状直接对号入座，并写明**某段为空 = 升级后还没重放操作**
+    （探针只在真的发生请求时才写）。
+- `FNMUSIC_MUSIC_DB` 的 `.env.example` 注释补上宿主机视角的示例路径
+  （`/vol1/@appdata/trim.music/db/music.db`）。
+
+### 测试
+
+- 新增 `proxy/tests/test_library_dir_detect.py`：覆盖显式 `FNMUSIC_LIBRARY_DIR` 优先、
+  配置 db 命中、宿主机布局兜底并留 INFO、INFO/WARNING 只打一次、坏 db 容错、
+  `resolve_music_db()` 优先级、启动自检两行。
+- `lxmusic-service/test_client_and_app.py` 新增 5 个迁移自举用例：`Path` 已导入、
+  历史 `uploads/*.js` 迁移上传（同名跳过）、历史 `state.json` 的源自动激活、
+  已有激活源不被历史配置覆盖、空环境跑完不报异常。
+- 顺手给依赖 POSIX 绝对路径的 `test_source_set_activates_unknown_local_file_by_import`
+  加 `os.name != "posix"` 跳过守卫（Windows 下 `urlparse("file://D:////...")` 会把盘符
+  并进 path，该用例在 Windows 必然红，与本次改动无关）。
+
 ## [2.7.8] - 2026-10-10
 
 ### 修复
