@@ -54,6 +54,114 @@ SORT_OPTIONS = (
     {"id": "recommend", "label": "推荐"},
 )
 
+# 歌单分类（2026-10 实测各平台接口后固化）。
+#
+# 各平台分类体系与取值形态差异很大，故这里只统一「对外形状」：
+#   {"id": "<平台内取值>", "name": "<显示名>", "group": "<分组名>"}
+# 其中 id 对 tx/kg/kw 是平台分类数字 id，对 wy 是**中文分类名**（其 catlist
+# 接口已下线，cat 参数只认中文名）。咪咕无分类体系，不在表内。
+#
+# 数据来源（均为实测可用的公开网页端接口）：
+#   - tx: c.y.qq.com/splcloud/fcgi-bin/fcg_get_diss_tag_conf.fcg（权威分类树）
+#   - kg: mobilecdnbj.kugou.com/api/v3/tag/list?pid=0（父分类，取歌单需再查 tag/info）
+#   - kw: wapi.kuwo.cn/api/pc/classify/playlist/getTagList（含 digest）
+#   - wy: music.163.com/api/playlist/list?cat=<中文名>（catlist 已 404，这里固化常用项）
+#
+# 注意：这些 id 由平台维护，可能变动。app.py 侧的分类接口优先走**动态拉取**
+# （fetch_platform_categories），本表是动态拉取失败时的兜底，保证 UI 不空。
+CATEGORY_GROUP_FALLBACK: dict[str, list[dict[str, str]]] = {
+    "tx": [
+        {"id": "165", "name": "国语", "group": "语种"},
+        {"id": "167", "name": "英语", "group": "语种"},
+        {"id": "168", "name": "韩语", "group": "语种"},
+        {"id": "166", "name": "粤语", "group": "语种"},
+        {"id": "169", "name": "日语", "group": "语种"},
+        {"id": "170", "name": "小语种", "group": "语种"},
+        {"id": "6", "name": "流行", "group": "流派"},
+        {"id": "15", "name": "轻音乐", "group": "流派"},
+        {"id": "11", "name": "摇滚", "group": "流派"},
+        {"id": "28", "name": "民谣", "group": "流派"},
+        {"id": "153", "name": "嘻哈", "group": "流派"},
+        {"id": "24", "name": "电子", "group": "流派"},
+        {"id": "27", "name": "古典", "group": "流派"},
+        {"id": "21", "name": "爵士", "group": "流派"},
+        {"id": "39", "name": "ACG", "group": "主题"},
+        {"id": "136", "name": "经典", "group": "主题"},
+        {"id": "133", "name": "影视", "group": "主题"},
+        {"id": "131", "name": "儿歌", "group": "主题"},
+        {"id": "145", "name": "中国风", "group": "主题"},
+        {"id": "194", "name": "古风", "group": "主题"},
+        {"id": "148", "name": "情歌", "group": "主题"},
+        {"id": "14", "name": "DJ", "group": "主题"},
+        {"id": "52", "name": "伤感", "group": "心情"},
+        {"id": "122", "name": "安静", "group": "心情"},
+        {"id": "116", "name": "治愈", "group": "心情"},
+        {"id": "125", "name": "励志", "group": "心情"},
+        {"id": "78", "name": "睡前", "group": "场景"},
+        {"id": "101", "name": "学习", "group": "场景"},
+        {"id": "99", "name": "运动", "group": "场景"},
+        {"id": "85", "name": "开车", "group": "场景"},
+        {"id": "94", "name": "工作", "group": "场景"},
+        {"id": "81", "name": "旅行", "group": "场景"},
+    ],
+    "kg": [
+        {"id": "153", "name": "专区", "group": "分类"},
+        {"id": "2005", "name": "心情", "group": "分类"},
+        {"id": "1263", "name": "特色", "group": "分类"},
+        {"id": "2003", "name": "场景", "group": "分类"},
+        {"id": "2007", "name": "主题", "group": "分类"},
+        {"id": "2009", "name": "语言", "group": "分类"},
+        {"id": "1599", "name": "风格", "group": "分类"},
+        {"id": "2011", "name": "乐器", "group": "分类"},
+        {"id": "68", "name": "经典", "group": "热门"},
+        {"id": "12", "name": "国风", "group": "热门"},
+    ],
+    "kw": [
+        {"id": "211", "name": "经典老歌", "group": "专区"},
+        {"id": "87", "name": "网红", "group": "专区"},
+        {"id": "1", "name": "DJ", "group": "专区"},
+        {"id": "13", "name": "轻音乐", "group": "专区"},
+        {"id": "12", "name": "国风", "group": "专区"},
+        {"id": "156", "name": "影视", "group": "专区"},
+        {"id": "6", "name": "动漫", "group": "专区"},
+        {"id": "17", "name": "新歌首发", "group": "专区"},
+        {"id": "2200", "name": "情歌", "group": "热门标签"},
+        {"id": "146", "name": "伤感", "group": "热门标签"},
+        {"id": "155", "name": "怀旧", "group": "热门标签"},
+        {"id": "127", "name": "古风", "group": "热门标签"},
+        {"id": "621", "name": "网络", "group": "热门标签"},
+        {"id": "173", "name": "轻音乐", "group": "热门标签"},
+    ],
+    # wy 的 cat 参数只认中文名（catlist 已下线，无法动态拉取）→ 固化常用分类
+    "wy": [
+        {"id": "华语", "name": "华语", "group": "语种"},
+        {"id": "欧美", "name": "欧美", "group": "语种"},
+        {"id": "日语", "name": "日语", "group": "语种"},
+        {"id": "韩语", "name": "韩语", "group": "语种"},
+        {"id": "粤语", "name": "粤语", "group": "语种"},
+        {"id": "流行", "name": "流行", "group": "风格"},
+        {"id": "摇滚", "name": "摇滚", "group": "风格"},
+        {"id": "民谣", "name": "民谣", "group": "风格"},
+        {"id": "电子", "name": "电子", "group": "风格"},
+        {"id": "说唱", "name": "说唱", "group": "风格"},
+        {"id": "古风", "name": "古风", "group": "风格"},
+        {"id": "轻音乐", "name": "轻音乐", "group": "风格"},
+        {"id": "ACG", "name": "ACG", "group": "风格"},
+        {"id": "影视原声", "name": "影视原声", "group": "主题"},
+        {"id": "怀旧", "name": "怀旧", "group": "主题"},
+        {"id": "治愈", "name": "治愈", "group": "主题"},
+        {"id": "伤感", "name": "伤感", "group": "心情"},
+        {"id": "安静", "name": "安静", "group": "心情"},
+        {"id": "运动", "name": "运动", "group": "场景"},
+        {"id": "学习", "name": "学习", "group": "场景"},
+        {"id": "睡前", "name": "睡前", "group": "场景"},
+    ],
+    "mg": [],
+}
+
+# 支持分类筛选的平台（咪咕无分类体系）
+CATEGORY_PLATFORMS = ("tx", "wy", "kw", "kg")
+
 _UA_PC = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
@@ -204,9 +312,12 @@ async def _tx_recommend(client: httpx.AsyncClient, sort: str, page: int, limit: 
     return out
 
 
-async def _wy_recommend(client: httpx.AsyncClient, sort: str, page: int, limit: int) -> list[dict]:
+async def _wy_recommend(client: httpx.AsyncClient, sort: str, page: int, limit: int,
+                        category: str = "") -> list[dict]:
     order = "new" if sort == "new" else "hot"
-    url = ("https://music.163.com/api/playlist/list?cat=" + quote("全部")
+    # cat 参数只认中文分类名（catlist 列表接口已 404，分类名固化在 CATEGORY_GROUP_FALLBACK）
+    cat = str(category or "").strip() or "全部"
+    url = ("https://music.163.com/api/playlist/list?cat=" + quote(cat)
            + f"&order={order}&limit={limit}&offset={(page - 1) * limit}")
     data = await _get(client, url, _WY_HEADERS)
     if not isinstance(data, dict) or not data.get("playlists"):
@@ -228,10 +339,17 @@ async def _wy_recommend(client: httpx.AsyncClient, sort: str, page: int, limit: 
     return out
 
 
-async def _kw_recommend(client: httpx.AsyncClient, sort: str, page: int, limit: int) -> list[dict]:
+async def _kw_recommend(client: httpx.AsyncClient, sort: str, page: int, limit: int,
+                        category: str = "") -> list[dict]:
     order = "new" if sort == "new" else "hot"
-    url = ("http://wapi.kuwo.cn/api/pc/classify/playlist/getRcmPlayList"
-           f"?loginUid=0&loginSid=0&appUid=76039576&pn={page}&rn={limit}&order={order}")
+    cat = str(category or "").strip()
+    if cat.isdigit():
+        # 指定分类：getTagPlayList（实测 id 即分类 id，digest 传 10000 或 43 均可）
+        url = ("http://wapi.kuwo.cn/api/pc/classify/playlist/getTagPlayList"
+               f"?loginUid=0&loginSid=0&pn={page}&rn={limit}&id={cat}&digest=10000")
+    else:
+        url = ("http://wapi.kuwo.cn/api/pc/classify/playlist/getRcmPlayList"
+               f"?loginUid=0&loginSid=0&appUid=76039576&pn={page}&rn={limit}&order={order}")
     data = await _get(client, url, _KW_HEADERS)
     inner = (data or {}).get("data", {}).get("data") if isinstance(data, dict) else None
     if not isinstance(inner, list):
@@ -250,25 +368,60 @@ async def _kw_recommend(client: httpx.AsyncClient, sort: str, page: int, limit: 
     return out
 
 
-async def _kg_recommend(client: httpx.AsyncClient, sort: str, page: int, limit: int) -> list[dict]:
+async def _kg_resolve_tag(client: httpx.AsyncClient, category: str) -> str:
+    """酷狗分类 id → 取歌单接口要的 special_tag_id（tag/info 解析；失败原样返回）。"""
+    cat = str(category or "").strip()
+    if not cat.isdigit():
+        return ""
+    url = f"http://mobilecdnbj.kugou.com/api/v3/tag/info?&id={cat}&apiver=2"
+    data = await _get(client, url, _KG_HEADERS)
+    if isinstance(data, dict):
+        info = data.get("data")
+        if isinstance(info, dict):
+            stid = info.get("special_tag_id")
+            if stid:
+                return str(stid)
+    return cat
+
+
+async def _kg_recommend(client: httpx.AsyncClient, sort: str, page: int, limit: int,
+                        category: str = "") -> list[dict]:
     sort_map = {"hot": "6", "new": "7", "recommend": "5"}
     t = sort_map.get(sort, sort_map["recommend"])
-    url = ("http://www2.kugou.kugou.com/yueku/v9/special/getSpecial"
-           f"?is_ajax=1&cdn=cdn&t={t}&c=&p={page}")
-    data = await _get(client, url, _KG_HEADERS)
-    rows = (data or {}).get("special_db") if isinstance(data, dict) else None
-    if not isinstance(rows, list):
-        return []
+    cat = str(category or "").strip()
+    if cat.isdigit():
+        # 指定分类：tag/specialList（tagid 需先由 tag/info 解析）
+        tagid = await _kg_resolve_tag(client, cat) or cat
+        url = ("http://mobilecdnbj.kugou.com/api/v3/tag/specialList"
+               f"?plat=0&page={page}&tagid={tagid}&pagesize={limit}&ugc=1&id={cat}&sort=2")
+        data = await _get(client, url, _KG_HEADERS)
+        rows = (data or {}).get("data", {}).get("info") if isinstance(data, dict) else None
+        if not isinstance(rows, list):
+            rows = (data or {}).get("data", {}).get("list") if isinstance(data, dict) else None
+        if not isinstance(rows, list):
+            # 分类接口不可用时退回通用热门（保证不空）
+            return await _kg_recommend(client, sort, page, limit, "")
+    else:
+        url = ("http://www2.kugou.kugou.com/yueku/v9/special/getSpecial"
+               f"?is_ajax=1&cdn=cdn&t={t}&c=&p={page}")
+        data = await _get(client, url, _KG_HEADERS)
+        rows = (data or {}).get("special_db") if isinstance(data, dict) else None
+        if not isinstance(rows, list):
+            return []
     out = []
     for item in rows:
         if not isinstance(item, dict):
             continue
         img = str(item.get("imgurl") or item.get("img") or "").replace("{size}", "400")
+        # 分类接口用 specialid，通用接口用 specialid；两者字段名一致
+        sid = item.get("specialid") or item.get("id") or ""
         out.append(_card(
-            "kg", f"id_{item.get('specialid')}", item.get("specialname") or "",
-            item.get("nickname") or item.get("singername") or "",
-            img, format_play_count(item.get("play_count") or item.get("total_play_count")),
-            item.get("songcount") or 0, item.get("intro") or "",
+            "kg", f"id_{sid}", item.get("specialname") or item.get("name") or "",
+            item.get("nickname") or item.get("singername") or item.get("username") or "",
+            img, format_play_count(item.get("play_count") or item.get("total_play_count")
+                                   or item.get("playcount")),
+            item.get("songcount") or item.get("song_count") or 0,
+            item.get("intro") or item.get("description") or "",
         ))
     return out
 
@@ -312,7 +465,9 @@ def _extract_mg_items(contents: list, out: list, seen: set) -> None:
             out.append(_card("mg", pid, name, "", img, "", 0, ""))
 
 
-async def _mg_recommend(client: httpx.AsyncClient, sort: str, page: int, limit: int) -> list[dict]:
+async def _mg_recommend(client: httpx.AsyncClient, sort: str, page: int, limit: int,
+                        category: str = "") -> list[dict]:
+    # 咪咕无分类体系（只有运营楼层），category 参数忽略
     url = ("https://app.c.nf.migu.cn/pc/bmw/page-data/playlist-square-recommend/v1.0"
            f"?templateVersion=2&pageNo={page}")
     data = await _get(client, url, _MG_HEADERS)
@@ -336,22 +491,128 @@ _RECOMMEND_MAP = {
 
 async def fetch_platform_playlists(
     client: httpx.AsyncClient, source: str, sort: str = "hot", page: int = 1, limit: int = 30,
+    category: str = "",
 ) -> list[dict]:
     """某平台的推荐歌单卡列表；不支持/失败返回 []。
+
+    category 为空 = 该平台「全部」（与原行为一致）。指定分类时按平台语义取值：
+    tx/kg/kw 传分类数字 id，wy 传中文分类名。mg 无分类体系，忽略该参数。
 
     部分上游（酷狗/咪咕）忽略请求的 size 参数按自己的页长返回，这里统一截断
     到 limit 内——否则注入侧 `recommend_playlist_page_size` 形同虚设。
     """
-    fn = _RECOMMEND_MAP.get(str(source or "").strip())
+    src = str(source or "").strip()
+    fn = _RECOMMEND_MAP.get(src)
     if not fn:
         return []
     limit = max(1, int(limit or 30))
+    cat = str(category or "").strip()
     try:
-        cards = await fn(client, str(sort or "hot"), max(1, int(page or 1)), limit)
+        if cat and src in CATEGORY_PLATFORMS:
+            cards = await fn(client, str(sort or "hot"), max(1, int(page or 1)), limit, cat)
+        else:
+            cards = await fn(client, str(sort or "hot"), max(1, int(page or 1)), limit)
     except Exception as exc:  # noqa: BLE001
         logger.debug("fetch_platform_playlists %s failed: %s", source, exc)
         return []
     return cards[:limit] if isinstance(cards, list) else []
+
+
+async def fetch_platform_categories(
+    client: httpx.AsyncClient, source: str,
+) -> list[dict[str, str]]:
+    """某平台的歌单分类列表 [{id, name, group}]；不支持/失败返回内置兜底表。
+
+    tx 走官方分类树接口（权威、动态）；kg/kw 走各自的 tag 接口；
+    wy 的 catlist 已下线（404），直接用固化表；mg 无分类体系返回 []。
+    一律不抛异常——UI 侧拿到空列表即隐藏该平台的分类选择。
+    """
+    src = str(source or "").strip()
+    fallback = list(CATEGORY_GROUP_FALLBACK.get(src) or [])
+    if src not in CATEGORY_PLATFORMS:
+        return []
+    try:
+        if src == "tx":
+            rows = await _tx_categories(client)
+        elif src == "kg":
+            rows = await _kg_categories(client)
+        elif src == "kw":
+            rows = await _kw_categories(client)
+        else:
+            rows = []
+        if rows:
+            return rows
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("fetch_platform_categories %s failed: %s", source, exc)
+    return fallback
+
+
+async def _tx_categories(client: httpx.AsyncClient) -> list[dict[str, str]]:
+    """QQ 官方分类树（fcg_get_diss_tag_conf），返回 6 组 60+ 分类。"""
+    url = ("https://c.y.qq.com/splcloud/fcgi-bin/fcg_get_diss_tag_conf.fcg"
+           "?picmid=1&rnd=0.1&g_tk=5381&format=json&inCharset=utf8&outCharset=utf-8")
+    data = await _get(client, url, _TX_HEADERS)
+    groups = (data or {}).get("data", {}).get("categories") if isinstance(data, dict) else None
+    if not isinstance(groups, list):
+        return []
+    out: list[dict[str, str]] = []
+    for g in groups:
+        if not isinstance(g, dict):
+            continue
+        gname = clean_html(g.get("categoryGroupName"))
+        for it in g.get("items") or []:
+            if not isinstance(it, dict):
+                continue
+            cid = it.get("categoryId")
+            cname = clean_html(it.get("categoryName"))
+            # 跳过「全部」（10000000）——它就是「不筛选」，由空 category 表达
+            if not cid or not cname or str(cid) == "10000000":
+                continue
+            out.append({"id": str(cid), "name": cname, "group": gname})
+    return out
+
+
+async def _kg_categories(client: httpx.AsyncClient) -> list[dict[str, str]]:
+    """酷狗分类树（tag/list pid=0）。children 为空，只取顶层父分类。"""
+    url = "http://mobilecdnbj.kugou.com/api/v3/tag/list?pid=0&apiver=2&plat=0"
+    data = await _get(client, url, _KG_HEADERS)
+    rows = (data or {}).get("data", {}).get("info") if isinstance(data, dict) else None
+    if not isinstance(rows, list):
+        return []
+    out: list[dict[str, str]] = []
+    for it in rows:
+        if not isinstance(it, dict):
+            continue
+        cid = it.get("id")
+        cname = clean_html(it.get("name"))
+        if not cid or not cname:
+            continue
+        out.append({"id": str(cid), "name": cname, "group": "分类"})
+    return out
+
+
+async def _kw_categories(client: httpx.AsyncClient) -> list[dict[str, str]]:
+    """酷我分类（getTagList：data[].data[]，每项含 id/name/digest）。"""
+    url = ("http://wapi.kuwo.cn/api/pc/classify/playlist/getTagList"
+           "?loginUid=0&loginSid=0")
+    data = await _get(client, url, _KW_HEADERS)
+    groups = (data or {}).get("data") if isinstance(data, dict) else None
+    if not isinstance(groups, list):
+        return []
+    out: list[dict[str, str]] = []
+    for g in groups:
+        if not isinstance(g, dict):
+            continue
+        gname = clean_html(g.get("name")) or "专区"
+        for it in g.get("data") or []:
+            if not isinstance(it, dict):
+                continue
+            cid = it.get("id")
+            cname = clean_html(it.get("name"))
+            if not cid or not cname:
+                continue
+            out.append({"id": str(cid), "name": cname, "group": gname})
+    return out
 
 
 # --------------------------------------------------------------- 歌单详情曲目 --
