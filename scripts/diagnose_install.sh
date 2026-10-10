@@ -83,8 +83,16 @@ run docker image inspect fnmusic-sources:latest
 sec "6. 磁盘空间"
 run df -h / /var/lib/docker
 sec "6b. 当前 .env 中的基础镜像记录"
-if [ -f /var/apps/fnmusic-ext/repo/.env ]; then
-    grep -E '^FNMUSIC_(BASE_IMAGE|PIP_INDEX|APT_MIRROR)=' /var/apps/fnmusic-ext/repo/.env | tee -a "${OUT}"
+# 仓库载荷落点随 fnOS 版本不同（<app>/target/repo 或 <app>/repo），逐个探测而不是硬编码
+ENV_FILE=""
+for _cand in /var/apps/fnmusic-ext/target/repo/.env /var/apps/fnmusic-ext/repo/.env; do
+    if [ -f "${_cand}" ]; then ENV_FILE="${_cand}"; break; fi
+done
+if [ -n "${ENV_FILE}" ]; then
+    echo ".env: ${ENV_FILE}" | tee -a "${OUT}"
+    grep -E '^FNMUSIC_(BASE_IMAGE|PIP_INDEX|APT_MIRROR)=' "${ENV_FILE}" | tee -a "${OUT}"
+else
+    echo "(未找到 repo/.env；git clone 方式安装时仓库目录由你自定)" | tee -a "${OUT}"
 fi
 
 sec "诊断完成"

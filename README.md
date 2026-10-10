@@ -188,8 +188,8 @@ git pull
 - **诊断脚本在哪里**：这些脚本随 fpk 一起装在**应用目录**里（不是 git 克隆的工作区）。不同 fnOS 版本的落点略有差异，先定位再运行：
 
   ```bash
-  # 一步定位
-  sudo find /var/apps/fnmusic-ext -maxdepth 3 -name 'diagnose_*.sh'
+  # 一步定位（不要加 -maxdepth 限制：脚本可能在 target/repo/scripts 这类更深一层）
+  sudo find /var/apps/fnmusic-ext -name 'diagnose_*.sh'
   ```
 
   常见落点是 `/var/apps/fnmusic-ext/target/repo/scripts/`（也可能是 `/var/apps/fnmusic-ext/repo/scripts/`）：
