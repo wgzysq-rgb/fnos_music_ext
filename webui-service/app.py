@@ -76,6 +76,7 @@ SCHEMA: dict[str, dict] = {
     "FNMUSIC_RECOMMEND_PLAYLIST": {"kind": "bool", "default": "false", "group": "recommend", "reload": "hot", "label": "平台推荐歌单（发现）"},
     "FNMUSIC_RECOMMEND_PLAYLIST_SOURCE": {"kind": "csv", "default": "", "group": "recommend", "reload": "hot", "label": "平台歌单平台白名单（空=全部）"},
     "FNMUSIC_RECOMMEND_PLAYLIST_PAGE_SIZE": {"kind": "int", "default": "12", "min": 1, "max": 30, "group": "recommend", "reload": "hot", "label": "每平台歌单数量"},
+    "FNMUSIC_RECOMMEND_PLAYLIST_CATEGORY": {"kind": "csv", "default": "", "group": "recommend", "reload": "hot", "label": "歌单分类（格式 平台:分类id）"},
     "FNMUSIC_TEE_SAVE_ENABLED": {"kind": "bool", "default": "true", "group": "tee", "reload": "hot", "label": "边听边存"},
     "FNMUSIC_TEE_SAVE_DIR": {"kind": "str", "default": "", "group": "tee", "reload": "hot", "label": "保存路径（留空自动探测）"},
     "FNMUSIC_TEE_CACHE_MAX": {"kind": "int", "default": "2", "min": 1, "max": 100, "group": "tee", "reload": "hot", "label": "关闭时滚动缓存数"},
@@ -689,6 +690,62 @@ async def api_platforms(request: Request):
             status_code=503,
         )
     return {"ok": True, "enabled": data.get("enabled") or [], "registered": data.get("registered") or []}
+
+
+# ------------------------------------------------- 歌单分类（复用 proxy 平台层） --
+
+# 分类数据带进程内缓存：平台分类变动很慢，避免设置页每次打开都打上游。
+_CATEGORY_CACHE: dict[str, tuple[float, list]] = {}
+_CATEGORY_CACHE_TTL_S = 3600.0
+
+
+@app.get("/api/playlist-categories")
+async def api_playlist_categories(request: Request, source: str = ""):
+    """某平台的歌单分类列表（供设置页多选渲染）。source 为空返回全部平台。
+
+    直接复用 proxy.platform_playlists（同一份代码，避免两处实现漂移）；
+    上游不可用时平台层已内置兜底表，这里再兜一层异常 → 绝不 5xx。
+    """
+    try:
+        from proxy import platform_playlists as plpl
+    except Exception as exc:  # noqa: BLE001
+        # 载荷事故（v2.8.0）：镜像只 COPY 了 proxy/__init__.py 与 env_merge.py，
+        # 这里 import platform_playlists 会 ModuleNotFoundError。把原因原样带出去，
+        # 避免只看到「分类模块不可用」还得猜。
+        logger.warning("导入 platform_playlists 失败: %s", exc)
+        return {"ok": False, "error": f"分类模块不可用: {exc}", "categories": {}}
+
+    src = str(source or "").strip().lower()
+    client = get_http(request)
+    now = time.time()
+
+    async def _cats(s: str):
+        hit = _CATEGORY_CACHE.get(s)
+        if hit and now - hit[0] < _CATEGORY_CACHE_TTL_S:
+            return hit[1]
+        try:
+            rows = await plpl.fetch_platform_categories(client, s)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("拉取 %s 分类失败: %s", s, exc)
+            rows = []
+        if rows:
+            _CATEGORY_CACHE[s] = (time.time(), rows)
+        return rows
+
+    if src:
+        if src not in plpl.CATEGORY_PLATFORMS:
+            return {"ok": True, "source": src, "categories": []}
+        return {"ok": True, "source": src, "categories": await _cats(src)}
+
+    results = await asyncio.gather(
+        *(_cats(s) for s in plpl.CATEGORY_PLATFORMS), return_exceptions=True
+    )
+    out: dict[str, list] = {}
+    for s, rows in zip(plpl.CATEGORY_PLATFORMS, results):
+        out[s] = [] if isinstance(rows, Exception) else rows
+    return {"ok": True,
+            "platforms": {k: plpl.PLATFORM_LABELS.get(k, k) for k in plpl.CATEGORY_PLATFORMS},
+            "categories": out}
 
 
 # ------------------------------------------------- 网易扫码（反代 musicbox） --
