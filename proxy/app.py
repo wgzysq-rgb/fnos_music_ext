@@ -198,6 +198,9 @@ CONF = {
     "recommend_playlist": os.environ.get("FNMUSIC_RECOMMEND_PLAYLIST", "false").lower() in ("true", "1", "yes"),
     "recommend_playlist_source": (os.environ.get("FNMUSIC_RECOMMEND_PLAYLIST_SOURCE") or "").strip().lower(),
     "recommend_playlist_page_size": max(1, min(30, int(os.environ.get("FNMUSIC_RECOMMEND_PLAYLIST_PAGE_SIZE", "12") or 12))),
+    # 歌单分类筛选（csv，格式 <平台>:<分类id>，如 tx:11,tx:194,kg:12）。
+    # 空 = 各平台「全部」，与原行为完全一致；非空时每个分类各取 page_size 条后合并去重。
+    "recommend_playlist_category": (os.environ.get("FNMUSIC_RECOMMEND_PLAYLIST_CATEGORY") or "").strip(),
     # 网易账号歌单注入（2.6.0）：默认关；需网易盒子启用并扫码登录，
     # 音乐页在热门推荐与官方歌单之间展示账号自建歌单（只读，不回写网易）
     "netease_my_playlists": os.environ.get("FNMUSIC_NETEASE_MY_PLAYLISTS", "false").lower() in ("true", "1", "yes"),
@@ -525,6 +528,7 @@ _ENV_WATCH_KEYS: dict[str, tuple[str, str]] = {
     "FNMUSIC_RECOMMEND_PLAYLIST": ("recommend_playlist", "bool"),
     "FNMUSIC_RECOMMEND_PLAYLIST_SOURCE": ("recommend_playlist_source", "str"),
     "FNMUSIC_RECOMMEND_PLAYLIST_PAGE_SIZE": ("recommend_playlist_page_size", "pl_page_size"),
+    "FNMUSIC_RECOMMEND_PLAYLIST_CATEGORY": ("recommend_playlist_category", "str"),
     "FNMUSIC_NETEASE_MY_PLAYLISTS": ("netease_my_playlists", "bool"),
     "FNMUSIC_COVER_DIR": ("cover_dir", "str"),
     "FNMUSIC_COVER_PROXY": ("cover_proxy", "bool"),
@@ -3290,6 +3294,33 @@ async def log_client_requests(request: Request, call_next):
 @app.get("/_ext/livez")
 async def ext_livez():
     return {"ok": True, "service": "fnmusic-ext", "pid": os.getpid()}
+
+
+@app.get("/_ext/playlist-categories")
+async def ext_playlist_categories(request: Request, source: str = ""):
+    """某平台的歌单分类列表（供 WebUI 设置页渲染多选项）。
+
+    source 为空 → 返回所有支持分类的平台；一次请求即可填满整个设置页。
+    tx/kg/kw 动态拉上游分类接口，wy 用固化表，mg 无分类体系（返回空）。
+    上游失败一律回落内置兜底表，绝不 5xx。
+    """
+    src = str(source or "").strip().lower()
+    client = get_platform_client(request.app)
+    if src:
+        if src not in plpl.CATEGORY_PLATFORMS:
+            return {"ok": True, "source": src, "categories": []}
+        cats = await plpl.fetch_platform_categories(client, src)
+        return {"ok": True, "source": src, "categories": cats}
+    results = await asyncio.gather(
+        *(plpl.fetch_platform_categories(client, s) for s in plpl.CATEGORY_PLATFORMS),
+        return_exceptions=True,
+    )
+    out: dict[str, list] = {}
+    for s, cats in zip(plpl.CATEGORY_PLATFORMS, results):
+        out[s] = [] if isinstance(cats, Exception) else cats
+    return {"ok": True, "platforms": {k: plpl.PLATFORM_LABELS.get(k, k)
+                                      for k in plpl.CATEGORY_PLATFORMS},
+            "categories": out}
 
 
 @app.get("/_ext/healthz")
@@ -7441,19 +7472,69 @@ def _discover_platform_cards(source: str, cards: list[dict]) -> list[dict]:
     return out
 
 
+def _discover_categories_for(source: str) -> list[str]:
+    """该平台配置的分类列表（来自 FNMUSIC_RECOMMEND_PLAYLIST_CATEGORY）。
+
+    格式 `<平台>:<分类id>`，逗号分隔，如 `tx:11,tx:194,kg:12`。
+    解析失败/未配置该平台 → 返回 []（= 走「全部」，保持原行为）。
+    """
+    raw = str(CONF.get("recommend_playlist_category") or "").strip()
+    if not raw:
+        return []
+    src = str(source or "").strip()
+    out: list[str] = []
+    for item in raw.replace("，", ",").split(","):
+        piece = item.strip()
+        if not piece or ":" not in piece:
+            continue
+        p, _, cid = piece.partition(":")
+        if p.strip().lower() != src:
+            continue
+        cid = cid.strip()
+        if cid and cid not in out:
+            out.append(cid)
+    return out
+
+
 async def _fetch_discover_cards(source: str) -> list[dict]:
-    """拉某平台推荐歌单卡（带 TTL 内存缓存）。失败回落落盘索引，仍无则 []。"""
+    """拉某平台推荐歌单卡（带 TTL 内存缓存）。失败回落落盘索引，仍无则 []。
+
+    配置了分类时（FNMUSIC_RECOMMEND_PLAYLIST_CATEGORY）逐分类抓取后合并去重：
+    每个分类各取 page_size 条，跨分类按 pid 去重（同一歌单可能挂多个标签）。
+    """
+    cats = _discover_categories_for(source)
+    cache_key = source if not cats else f"{source}|{'~'.join(cats)}"
     now = time.time()
-    cached = _DISCOVER_CACHE.get(source)
+    cached = _DISCOVER_CACHE.get(cache_key)
     if cached and now - cached[0] < _DISCOVER_CACHE_TTL_S:
         return cached[1]
     client = get_platform_client(app)
     limit = int(CONF.get("recommend_playlist_page_size") or 12)
     async with _DISCOVER_LOCK:
-        cached = _DISCOVER_CACHE.get(source)
+        cached = _DISCOVER_CACHE.get(cache_key)
         if cached and time.time() - cached[0] < _DISCOVER_CACHE_TTL_S:
             return cached[1]
-        cards = await plpl.fetch_platform_playlists(client, source, "hot", 1, limit)
+        if not cats:
+            cards = await plpl.fetch_platform_playlists(client, source, "hot", 1, limit)
+        else:
+            batches = await asyncio.gather(
+                *(plpl.fetch_platform_playlists(client, source, "hot", 1, limit, cat)
+                  for cat in cats),
+                return_exceptions=True,
+            )
+            seen: set[str] = set()
+            cards = []
+            for batch in batches:
+                if isinstance(batch, Exception) or not batch:
+                    continue
+                for card in batch:
+                    pid = str(card.get("id") or "")
+                    if not pid or pid in seen:
+                        continue
+                    seen.add(pid)
+                    cards.append(card)
+            if not cards:
+                logger.info("discover: %s 分类抓取全部为空（cats=%s）", source, cats)
         if not cards:
             # 上游不可用（弱网/限流/风控）时不要整块消失：用落盘索引里的卡片兜底，
             # 否则歌单列表只剩「通用名」条目（App 转而按 guid 反查详情）。
@@ -7462,7 +7543,7 @@ async def _fetch_discover_cards(source: str) -> list[dict]:
                 logger.info("discover: %s 上游不可用，回落落盘索引 %d 张卡片",
                             source, len(cards))
         if cards:
-            _DISCOVER_CACHE[source] = (time.time(), cards)
+            _DISCOVER_CACHE[cache_key] = (time.time(), cards)
     return cards
 
 
