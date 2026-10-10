@@ -51,6 +51,16 @@ def normalize_source(src: str | None) -> str:
     return _SOURCE_ALIASES.get(src.strip().lower(), "")
 
 
+def _safe_body(resp: "httpx.Response", limit: int = 200) -> str:
+    """响应体摘要：仅用于诊断日志，截断并压掉换行（不引入额外依赖）。"""
+    try:
+        text = resp.text
+    except Exception:  # noqa: BLE001
+        return "<body unreadable>"
+    text = " ".join(str(text).split())
+    return text[:limit]
+
+
 def parse_interval_to_seconds(interval: str | int | float | None) -> int:
     """解析 "05:24" 或 324 -> 324 秒。"""
     if interval is None:
@@ -397,11 +407,15 @@ class LxServerClient:
 
     # ------------------------------------------------------------- 榜单端点 --
     async def get_leaderboard_boards(self, source: str = "kg") -> list[dict]:
-        """获取平台的可用榜单列表。"""
+        """获取平台的可用榜单列表（每项含 id/name/bangid）。"""
         src = normalize_source(source) or "kg"
         client = await self.get_client()
         resp = await client.get("/api/music/leaderboard/boards", params={"source": src}, timeout=self.timeout)
         if resp.status_code != 200:
+            logger.warning(
+                "lxserver leaderboard/boards %s http %s: %.200s",
+                src, resp.status_code, _safe_body(resp),
+            )
             return []
         data = resp.json()
         if isinstance(data, dict) and isinstance(data.get("list"), list):
@@ -410,13 +424,48 @@ class LxServerClient:
             return data
         return []
 
+    async def resolve_leaderboard_bangid(self, source: str, name_hint: str = "") -> str:
+        """按平台查真实 bangid：优先名字含 name_hint，否则取榜单列表首项。
+
+        boards 返回形如 `{"id":"kg__8888","name":"TOP500","bangid":"8888"}`，
+        **list 端点只认 bangid**。硬编码 bangid 会在平台调榜时失效，
+        故运行期以 boards 为准；查不到返回 ""（调用方回落内置默认值）。
+        """
+        boards = await self.get_leaderboard_boards(source)
+        if not boards:
+            return ""
+        hint = str(name_hint or "").strip().lower()
+        if hint:
+            for b in boards:
+                if not isinstance(b, dict):
+                    continue
+                if hint in str(b.get("name") or "").lower():
+                    bid = str(b.get("bangid") or "").strip()
+                    if bid:
+                        return bid
+        first = boards[0] if isinstance(boards[0], dict) else {}
+        return str(first.get("bangid") or "").strip()
+
     async def get_leaderboard_list(self, source: str, board_id: str, page: int = 1) -> list[dict]:
-        """获取指定榜单内的歌曲列表并做数据映射。"""
+        """获取指定榜单内的歌曲列表并做数据映射。
+
+        lxserver 的 `/api/music/leaderboard/list` 只认 **`bangid`** 查询参数
+        （不是 `id`）：boards 端点返回 `{"id":"kg__8888","name":"TOP500","bangid":"8888"}`，
+        而 list 端点传 `id=8888`（或任何 `id=` 形态）一律回 `Missing bangid`
+        （2026-10 实测，非 200）。此前传 `id=` 导致本方法恒 `return []`，
+        上游 hot 歌单因此长期为空 —— 这里修正为 `bangid`。
+
+        失败原因不再静默：非 200 打 warning 并带上状态码与响应体片段。
+        """
         src = normalize_source(source)
         client = await self.get_client()
-        params = {"source": src, "id": board_id, "page": page}
+        params = {"source": src, "bangid": board_id, "page": page}
         resp = await client.get("/api/music/leaderboard/list", params=params, timeout=self.timeout)
         if resp.status_code != 200:
+            logger.warning(
+                "lxserver leaderboard/list %s bangid=%s http %s: %.200s",
+                src, board_id, resp.status_code, _safe_body(resp),
+            )
             return []
         data = resp.json()
         raw_list = []
@@ -424,6 +473,11 @@ class LxServerClient:
             raw_list = data["list"]
         elif isinstance(data, list):
             raw_list = data
+        if not raw_list:
+            logger.warning(
+                "lxserver leaderboard/list %s bangid=%s 返回空列表（total=%s）",
+                src, board_id, (data or {}).get("total") if isinstance(data, dict) else "-",
+            )
 
         items = []
         for raw in raw_list:

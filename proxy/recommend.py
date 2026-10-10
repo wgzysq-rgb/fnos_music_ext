@@ -1007,15 +1007,24 @@ async def fetch_lx_charts(client: httpx.AsyncClient, limit: int, sources: "list[
     try:
         r = await client.get("/api/v1/recommend", params=params, timeout=20.0)
         if r.status_code != 200:
-            logger.debug("lx charts http %s", r.status_code)
+            logger.warning("lx charts http %s (sources=%s)", r.status_code, params.get("sources") or "-")
             return []
         data = r.json()
     except Exception as e:
-        logger.debug("lx charts failed: %s", e)
+        logger.warning("lx charts failed: %s", e)
         return []
+    # 洛雪侧逐平台的失败原因（errors 字典）必须透出：此前被整块丢弃，
+    # 导致「榜单取数失败」在代理侧完全无痕（hot 空歌单难排查的根源之一）。
+    if isinstance(data, dict) and data.get("errors"):
+        logger.warning("lx charts upstream errors: %.300s", data.get("errors"))
     rows = data.get("items") if isinstance(data, dict) else None
     if not isinstance(rows, list):
+        logger.warning("lx charts malformed payload keys=%.120s",
+                       list(data.keys()) if isinstance(data, dict) else type(data).__name__)
         return []
+    if not rows:
+        logger.warning("lx charts empty items (sources=%s, errors=%s)",
+                       params.get("sources") or "-", (data.get("errors") if isinstance(data, dict) else None))
     out: list[dict] = []
     for it in rows:
         if isinstance(it, dict):
@@ -1729,20 +1738,29 @@ async def get_or_build_daily(
 
     async def from_netease_charts(on_track=None, should_stop=None) -> list[dict]:
         if not (recommend_hot and netease_enabled and musicbox_client):
+            # 不再静默：healthz 里能看到「这一层为何缺席」，否则 hot 空歌单全是黑盒
+            tier_failures.append("netease-charts:unavailable")
             return []
         items = await fetch_musicbox_recommend(
             musicbox_client, "/api/v1/toplist",
             {"index": NETEASE_TOPLIST_INDEX, "limit": CHART_FETCH_COUNT},
         )
         if not items:
+            tier_failures.append("netease-charts:empty")
             return []
         return resolve_source_candidates(items, build_track, PLAYLIST_SIZE, exclude_guids, exclude_ta)
 
     async def from_lx_charts(on_track=None, should_stop=None) -> list[dict]:
         if not (recommend_hot and lx_enabled and lx_client):
+            tier_failures.append("lx-charts:unavailable")
             return []
         items = await fetch_lx_charts(lx_client, CHART_FETCH_COUNT, sources=lx_sources)
         if not items:
+            # lx_sources 与榜单平台（kg/wy/kw）无交集时 fetch_lx_charts 也会静默返回空，
+            # 这里统一记为 failure 并带上实际白名单，便于区分「配置问题」与「上游故障」
+            chart_overlap = [s for s in (lx_sources or []) if s in ("kg", "wy", "kw")]
+            reason = "no-platform-overlap" if (lx_sources and not chart_overlap) else "empty"
+            tier_failures.append(f"lx-charts:{reason}")
             return []
         return resolve_source_candidates(items, build_track, PLAYLIST_SIZE, exclude_guids, exclude_ta)
 

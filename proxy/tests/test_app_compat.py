@@ -324,6 +324,37 @@ def test_safe_child_log_allows_request_log_and_degrade():
     assert safe_child_log("2026-09-18 10:00:00,123 [INFO] fnmusic_proxy: secret token abc123") is None
 
 
+def test_safe_child_log_allows_observability_lines():
+    """观测行放行（2026-10-10）：启动版本/[自检]/cover probe 此前被白名单丢弃，
+    导致诊断脚本 5a/5b 与自检段恒为空，反复误判成「升级没生效」。"""
+    for line in (
+        "2026-10-10 20:21:28,001 [INFO] fnmusic_proxy: === fnmusic-ext v2.7.9 configuration ===",
+        "2026-10-10 20:21:28,002 [INFO] fnmusic_proxy:   [自检] 曲库目录 = /vol1/1000/音乐",
+        "2026-10-10 20:21:28,003 [INFO] fnmusic_proxy:   [自检] 边听边存落盘目录 = /vol1/1000/音乐/柠檬音乐更新",
+        "2026-10-10 20:21:28,004 [INFO] fnmusic_proxy: 曲库自动探测命中：music.db=/vol1/@appdata/trim.music/db/music.db",
+        "2026-10-10 20:22:10,100 [INFO] fnmusic_proxy: cover probe: GET coverId=track_ab12cd size=- -> 302 redirect->http://img.test/x.jpg",
+        "2026-10-10 20:22:10,200 [INFO] fnmusic_proxy: playlist cover online:playlist:hot:x kind=hot picked=- -> placeholder(no usable cover)",
+        "2026-10-10 20:22:10,300 [INFO] fnmusic_proxy: lx charts empty items (sources=kg,kw,wy, errors={'kg': 'Missing bangid'})",
+        "2026-10-10 20:22:10,400 [INFO] fnmusic_proxy: hot recommend online:playlist:hot:x tracks=0 status=partial tiers=-",
+    ):
+        assert safe_child_log(line) is not None, f"观测行应放行：{line}"
+
+    # 反例：真实凭据/开放文本仍必须被拦（放行观测行不得扩大攻击面）
+    for bad in (
+        "2026-10-10 20:21:28,001 [INFO] fnmusic_proxy: FNMUSIC_LLM_API_KEY = sk-live-abcdef",
+        "2026-10-10 20:21:28,001 [INFO] fnmusic_proxy: arbitrary free text with cookie=session123",
+        "2026-10-10 20:21:28,001 [INFO] fnmusic_proxy: random message not in allowlist",
+    ):
+        assert safe_child_log(bad) is None, f"非白名单行仍应丢弃：{bad}"
+
+    # 显式注入的 secret 在放行行里也必须被替换
+    out = safe_child_log(
+        "2026-10-10 20:21:28,001 [INFO] fnmusic_proxy: === fnmusic-ext v2.7.9 configuration ===",
+        secrets=("2.7.9",),
+    )
+    assert out is not None and "2.7.9" not in out
+
+
 def test_search_response_disguised_no_online_prefix():
     """搜索结果零 online: 泄漏，假 id 可反解，coverId 带 track_ 前缀。"""
     from proxy.app import resolve_real_guid

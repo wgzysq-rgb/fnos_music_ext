@@ -504,6 +504,10 @@ def diagnostic(text):
 # Retain fixed operational prefixes, not arbitrary exception text, response
 # dictionaries, config values or URLs appended to them. This deliberately small
 # allowlist covers source/search/stream/auth/recommend failures in the current app.
+#
+# 2026-10-10 追加「观测行」：此前 [自检] / cover probe / 启动版本行全被本白名单
+# 丢弃，导致 diagnose_playback.sh 的 5a/5b 段与启动自检段**恒为空**，排查时
+# 反复误判成「升级没生效/跑的是旧代码」。这些行内容固定、不含凭据，放行。
 _SAFE_OUTCOME = re.compile(
     r'(?:\[dl-capture\] [ -~]{0,600}|'
     r'audio decode check failed for [!-~]{1,120} \(ext=[a-z0-9]{1,8} bytes=[0-9]{1,12}\)|'
@@ -525,6 +529,18 @@ _SAFE_OUTCOME = re.compile(
     r'llm call failed|daily recommend (?:peek|list inject|llm branch|fallback branch) failed|'
     r'Failed to (?:read|write|load|save|parse|remember)|failed to (?:read|write|load|map|purge)|'
     r'(?:favorite|play history) list degraded to official-only|'
+    # --- 观测行（新增，固定格式、无凭据） ---
+    r'=== fnmusic-ext v[0-9][!-~]{0,20} configuration ===|'
+    r'={10,}|'
+    r'\[自检\] [^\n]{0,200}|'
+    r'llm_enabled = (?:True|False)|'
+    r'曲库自动探测命中：music\.db=[^\n]{0,200}|'
+    r'cover probe: (?:GET|HEAD) [!-~]{1,200} size=[!-~]{0,40} -> [0-9]{3}[^\n]{0,140}|'
+    r'playlist cover [!-~]{1,140} kind=[a-z]{1,12} picked=[!-~]{0,140} -> [^\n]{0,120}|'
+    r'netease playlist cover [!-~]{1,140} -> [^\n]{0,80}|'
+    r'discover: (?:从磁盘恢复 [0-9]{1,6} 张推荐歌单卡片元数据|[^\n]{0,160})|'
+    r'(?:daily|hot) recommend [!-~]{1,160} tracks=[0-9]{1,6} status=[a-z]{1,12} tiers=[^\n]{0,80}|'
+    r'lx charts (?:upstream errors|empty items|malformed payload)[^\n]{0,300}|'
     r'client request (?:GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS) /[!-~]{1,180} status=[1-5][0-9]{2} ua=[ -~]{1,100})',
     re.I,
 )

@@ -5,6 +5,51 @@
 
 ## [Unreleased]
 
+## [2.7.10] - 2026-10-10
+
+### 修复
+
+- **「热门推荐」歌单长期为空（`trackCount=0`）→ 连带表现为「推荐歌单没有封面」**：
+  lxserver 的 `/api/music/leaderboard/list` **只认 `bangid` 查询参数**，传 `id=`
+  一律返回 `Missing bangid`（非 200）；而 `lxmusic-service/app.py` 硬编码的是
+  裸数字 `{"kg":"8888","kw":"93","wy":"3779629"}` 并作为 `id=` 发出 →
+  `get_leaderboard_list` 撞上 `if resp.status_code != 200: return []` 静默返回空 →
+  洛雪 `/api/v1/recommend` 返回 `{"items":[],"errors":{}}` → 代理 `from_lx_charts`
+  拿到空列表 → hot 歌单 0 首。歌单没有曲目，封面自然只剩占位图。
+  - `get_leaderboard_list` 改用 `bangid=` 传参（2026-10 实测的唯一可用契约）；
+  - 新增 `resolve_leaderboard_bangid()`：运行期先查 `/api/music/leaderboard/boards`
+    取该平台真实 `bangid`（可按榜单名匹配），取不到才回落内置默认值 ——
+    平台调榜时硬编码不再静默失效；
+  - `recommend_charts` 不再硬编码榜单 ID，改用上述解析结果。
+
+- **整条榜单链 4 处静默吞异常，让上述故障完全不可见**（用户端 healthz 只有
+  `tiers:[]` + `tierFailures:[]`，毫无线索）：
+  - `fetch_lx_charts` 不再丢弃洛雪返回的 `errors` 字典（改为 warning 透出，
+    并区分「空 items / 载荷畸形 / 上游 errors」三种情形）；
+  - `from_lx_charts` / `from_netease_charts` 的静默 `return []` 记入
+    `tier_failures`（`unavailable` / `empty` / `no-platform-overlap`），
+    healthz 现在能显示「是哪一层缺席、为什么」；
+  - `get_leaderboard_list` 非 200 打 warning 并带状态码与响应体摘要；
+  - `recommend_charts` 中「取到 200 但列表为空」也记入 `errors`（此前只有异常才记）。
+
+### 修复（可观测性）
+
+- **`takeover.py` 脱敏白名单误伤诊断行**：代理日志并非直接进 journal，而是经
+  `safe_child_log()` 的 `_SAFE_OUTCOME` 白名单过滤后转发。`=== fnmusic-ext v...
+  configuration ===`、`[自检] 曲库目录 / 边听边存落盘目录`、`cover probe:`、
+  `playlist cover ... placeholder`、`曲库自动探测命中` 等行**全被丢弃**，
+  导致 `diagnose_playback.sh` 的自检段与 5a/5b 段**恒为空**，排查时反复误判成
+  「升级没生效 / 跑的是旧代码」。现已把上述固定格式的观测行加入白名单
+  （均为固定前缀、不含凭据；显式注入的 secret 仍会被替换）。
+
+### 测试
+
+- `test_recommend_endpoint` 从「只断言 `isinstance(items, list)`」改为
+  **断言真的取到曲目 + 传给 lxserver 的是 `bangid` 而非 `id`** —— 此前空榜单
+  在测试里永远绿，是本故障得以长期潜伏的原因之一。
+- 新增 3 例 `bangid` 契约回归（请求参数断言、非 200 需告警、按名解析 bangid）。
+- 新增 `safe_child_log` 观测行放行测试（含凭据反例，确保未扩大攻击面）。
+
 ## [2.7.9] - 2026-10-10
 
 ### 修复

@@ -63,6 +63,8 @@ class FakeLxServerClient:
         self.upload_calls: list[tuple[str, str]] = []
         self.import_calls: list[str] = []
         self.deleted_ids: list[str] = []
+        self.leaderboard_list_calls: list[tuple[str, str, int]] = []
+        self.leaderboard_boards_calls: list[str] = []
 
     @staticmethod
     def _derive_source_id(filename: str, script: str) -> str:
@@ -110,7 +112,15 @@ class FakeLxServerClient:
         return self.lyric_result
 
     async def get_leaderboard_list(self, source: str, board_id: str, page: int = 1) -> list[dict]:
+        self.leaderboard_list_calls.append((source, board_id, page))
         return await self.search("榜单", source=source)
+
+    async def get_leaderboard_boards(self, source: str = "kg") -> list[dict]:
+        self.leaderboard_boards_calls.append(source)
+        return [{"id": f"{source}__8888", "name": "TOP500", "bangid": "8888"}]
+
+    async def resolve_leaderboard_bangid(self, source: str, name_hint: str = "") -> str:
+        return "8888"
 
     def get_cached_song_info(self, track_id: str) -> dict | None:
         return self._song_info_cache.get(track_id)

@@ -792,17 +792,31 @@ async def recommend_charts(limit: int = Query(0), sources: str = Query("")):
     items: list[dict] = []
     errors: dict[str, str] = {}
 
-    # 榜单映射
-    chart_ids = {
-        "kg": "8888",   # TOP500
-        "kw": "93",     # 飙升榜
-        "wy": "3779629",# 新歌榜
+    # 榜单默认 bangid（**注意：list 端点只认 bangid 参数，传 id= 一律 "Missing bangid"**）。
+    # 这些数字仅在 boards 查询失败时兜底；正常路径以 lxserver 返回的 bangid 为准
+    # （平台调榜时硬编码会静默失效，这正是 hot 歌单长期为空的根因）。
+    fallback_bangids = {
+        "kg": "8888",     # TOP500
+        "kw": "93",       # 飙升榜
+        "wy": "3779629",  # 新歌榜
     }
+    chart_names = {"kg": "TOP500", "kw": "飙升", "wy": "新歌"}
 
     for src in wanted:
-        bid = chart_ids.get(src, "")
         try:
-            sub = await LXSERVER.get_leaderboard_list(src, bid, page=1)
+            # 先问 lxserver 该平台真实可用的榜单 id（失败则回落内置默认值）
+            bangid = await LXSERVER.resolve_leaderboard_bangid(src, chart_names.get(src, ""))
+            if not bangid:
+                bangid = fallback_bangids.get(src, "")
+                logger.warning("lx recommend %s: boards 未取到 bangid，回落内置默认 %s", src, bangid)
+            if not bangid:
+                errors[src] = "no bangid available"
+                continue
+            sub = await LXSERVER.get_leaderboard_list(src, bangid, page=1)
+            if not sub:
+                # 取到 200 但列表为空：不再静默（此前这里整条链无痕）
+                errors[src] = f"empty leaderboard (bangid={bangid})"
+                continue
             for it in sub:
                 _cache_put(it)
                 items.append(it)

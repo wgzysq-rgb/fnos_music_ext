@@ -169,12 +169,28 @@ def test_search_endpoint(test_app_client):
     assert item["artist"] == "Beyond"
 
 
-def test_recommend_endpoint(test_app_client):
+def test_recommend_endpoint(test_app_client, fake_lx):
+    """榜单推荐：必须真的取到曲目，且传给 lxserver 的是 bangid 不是 id。
+
+    历史教训（2026-10-10）：本用例此前只断言 `isinstance(items, list)`，
+    空榜单也永远绿 —— 掩盖了「list 端点只认 bangid、传 id 恒回 Missing bangid」
+    导致 hot 歌单长期为空的真实故障。
+    """
     res = test_app_client.get("/api/v1/recommend?sources=kw&limit=5")
     assert res.status_code == 200
     data = res.json()
     assert data["ok"] is True
     assert isinstance(data["items"], list)
+    # 真的取到数据（fake 会返回搜索结果），不再是「空列表也算过」
+    assert len(data["items"]) > 0, f"expected non-empty chart items, errors={data.get('errors')}"
+    assert data["errors"] == {}
+    # 传给 lxserver 的必须是真实 bangid（0 参数位是 source，1 参数位是 bangid）
+    assert fake_lx.leaderboard_list_calls, "get_leaderboard_list 未被调用"
+    src, bangid, _page = fake_lx.leaderboard_list_calls[0]
+    assert src == "kw"
+    assert bangid and not bangid.startswith("kw__"), (
+        f"必须传 bangid（裸数字），实际传了 {bangid!r}"
+    )
 
 
 def test_track_info_endpoint(test_app_client):
@@ -524,3 +540,83 @@ def test_bootstrap_migration_keeps_existing_active_source(monkeypatch, tmp_path)
     monkeypatch.setattr(lxapp, "source_set", _forbidden_source_set)
 
     asyncio.run(lxapp._bootstrap_migration())
+
+
+# ------------------------------------------------- 榜单 bangid 契约（回归） --
+
+def _leaderboard_transport(record: list):
+    """桩：只接受 bangid= 参数，传 id= 一律回 "Missing bangid"（复刻 lxserver 真实行为）。"""
+    def handler(request: httpx.Request) -> httpx.Response:
+        record.append(dict(request.url.params))
+        if request.url.path == "/api/music/leaderboard/boards":
+            return httpx.Response(200, json={"list": [
+                {"id": "kg__8888", "name": "TOP500", "bangid": "8888"},
+                {"id": "kg__6666", "name": "飙升榜", "bangid": "6666"},
+            ]})
+        if request.url.path == "/api/music/leaderboard/list":
+            if "bangid" not in request.url.params:
+                return httpx.Response(400, text="Missing bangid")
+            return httpx.Response(200, json={"total": 1, "list": [{
+                "singer": "歌手", "name": "歌曲", "albumName": "专辑",
+                "songmid": 653605791, "source": "kg", "interval": "04:56",
+                "img": "http://imge.kugou.com/stdmusic/1000/x.jpg",
+                "hash": "ABC", "types": [{"type": "128k", "hash": "H1"}],
+            }]})
+        return httpx.Response(404)
+    return httpx.MockTransport(handler)
+
+
+@pytest.mark.anyio
+async def test_leaderboard_list_uses_bangid_not_id():
+    """list 端点必须传 bangid —— 传 id（任何形态）都会被 lxserver 拒为 Missing bangid。"""
+    from lxserver_client import LxServerClient
+
+    seen: list = []
+    async with httpx.AsyncClient(transport=_leaderboard_transport(seen),
+                                 base_url="http://127.0.0.1:8005") as http:
+        client = LxServerClient(base_url="http://127.0.0.1:8005")
+        client._client = http  # 注入桩
+        items = await client.get_leaderboard_list("kg", "8888", page=1)
+
+    assert len(items) == 1
+    assert items[0]["id"] == "lx:kg:abc"  # kg hash 小写化
+    assert items[0]["cover_url"] == "http://imge.kugou.com/stdmusic/1000/x.jpg"
+    # 请求里必须是 bangid=8888，不能是 id=8888 / id=kg__8888
+    list_calls = [p for p in seen if "bangid" in p or "id" in p]
+    assert any(p.get("bangid") == "8888" for p in list_calls), f"应传 bangid，实际 {list_calls}"
+    assert not any("id" in p and "bangid" not in p for p in list_calls), (
+        f"不得只传 id（会被拒为 Missing bangid）：{list_calls}"
+    )
+
+
+@pytest.mark.anyio
+async def test_leaderboard_list_non200_is_logged(caplog):
+    """非 200 不再静默：必须留下 warning（此前整条链无痕）。"""
+    from lxserver_client import LxServerClient
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(400, text="Missing bangid")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler),
+                                 base_url="http://127.0.0.1:8005") as http:
+        client = LxServerClient(base_url="http://127.0.0.1:8005")
+        client._client = http
+        with caplog.at_level(logging.WARNING, logger="fnmusic.lxserver"):
+            items = await client.get_leaderboard_list("kg", "8888")
+
+    assert items == []
+    assert any("leaderboard/list" in r.message and "400" in r.message for r in caplog.records), \
+        "非 200 必须打 warning 并带状态码"
+
+
+@pytest.mark.anyio
+async def test_resolve_leaderboard_bangid_prefers_name_hint():
+    """resolve_leaderboard_bangid 按名字命中真实 bangid，取不到回落首项。"""
+    from lxserver_client import LxServerClient
+
+    async with httpx.AsyncClient(transport=_leaderboard_transport([]),
+                                 base_url="http://127.0.0.1:8005") as http:
+        client = LxServerClient(base_url="http://127.0.0.1:8005")
+        client._client = http
+        assert await client.resolve_leaderboard_bangid("kg", "飙升") == "6666"
+        assert await client.resolve_leaderboard_bangid("kg", "不存在的榜单") == "8888"
