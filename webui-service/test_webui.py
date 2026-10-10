@@ -839,3 +839,127 @@ def test_api_config_put_retries_lx_activate_when_env_unchanged(env_file, svctl):
     assert len(activate_calls) == 1
     assert activate_calls[0]["url"] == "http://lx.test/source.js"
 
+
+# --------------------------------------------------------- 歌单分类端点（2.8.0） ---
+
+def test_playlist_categories_single_source(env_file, svctl, monkeypatch):
+    """单平台分类：复用 proxy 平台层，返回 [{id,name,group}]。"""
+    from proxy import platform_playlists as plpl
+
+    async def fake_cats(client, source):
+        assert source == "tx"
+        return [{"id": "11", "name": "摇滚", "group": "流派"},
+                {"id": "194", "name": "古风", "group": "主题"}]
+
+    monkeypatch.setattr(plpl, "fetch_platform_categories", fake_cats)
+    webui._CATEGORY_CACHE.clear()
+    with authed_client() as client:
+        r = client.get("/api/playlist-categories?source=tx")
+        assert r.status_code == 200
+        body = r.json()
+        assert body["ok"] is True
+        assert body["source"] == "tx"
+        assert [c["id"] for c in body["categories"]] == ["11", "194"]
+
+
+def test_playlist_categories_all_sources(env_file, svctl, monkeypatch):
+    """source 为空：一次返回全部支持分类的平台（含中文名）。"""
+    from proxy import platform_playlists as plpl
+
+    async def fake_cats(client, source):
+        return [{"id": f"{source}-1", "name": f"{source}分类", "group": "测试"}]
+
+    monkeypatch.setattr(plpl, "fetch_platform_categories", fake_cats)
+    webui._CATEGORY_CACHE.clear()
+    with authed_client() as client:
+        r = client.get("/api/playlist-categories")
+        assert r.status_code == 200
+        body = r.json()
+        assert set(body["categories"].keys()) == {"tx", "wy", "kw", "kg"}
+        assert body["platforms"]["tx"] == "QQ音乐"
+        assert body["categories"]["kg"][0]["id"] == "kg-1"
+
+
+def test_playlist_categories_unsupported_platform(env_file, svctl):
+    """不支持分类的平台（咪咕）返回空列表，绝不 5xx。"""
+    webui._CATEGORY_CACHE.clear()
+    with authed_client() as client:
+        r = client.get("/api/playlist-categories?source=mg")
+        assert r.status_code == 200
+        assert r.json()["categories"] == []
+
+
+def test_playlist_categories_upstream_error_does_not_500(env_file, svctl, monkeypatch):
+    """平台层抛异常时端点必须兜住，返回空/兜底表而不是 500。"""
+    from proxy import platform_playlists as plpl
+
+    async def boom(client, source):
+        raise RuntimeError("upstream down")
+
+    monkeypatch.setattr(plpl, "fetch_platform_categories", boom)
+    webui._CATEGORY_CACHE.clear()
+    with authed_client() as client:
+        r = client.get("/api/playlist-categories?source=tx")
+        assert r.status_code == 200
+        assert r.json()["categories"] == []
+
+
+# --------------------------------------------------------- 歌单分类端点（2.8.0） ---
+
+def test_playlist_categories_single_source(env_file, svctl, monkeypatch):
+    """单平台分类：复用 proxy 平台层，返回 [{id,name,group}]。"""
+    from proxy import platform_playlists as plpl
+
+    async def fake_cats(client, source):
+        assert source == "tx"
+        return [{"id": "11", "name": "摇滚", "group": "流派"},
+                {"id": "194", "name": "古风", "group": "主题"}]
+
+    monkeypatch.setattr(plpl, "fetch_platform_categories", fake_cats)
+    webui._CATEGORY_CACHE.clear()
+    with authed_client() as client:
+        r = client.get("/api/playlist-categories?source=tx")
+        assert r.status_code == 200
+        body = r.json()
+        assert body["ok"] is True
+        assert body["source"] == "tx"
+        assert [c["id"] for c in body["categories"]] == ["11", "194"]
+
+
+def test_playlist_categories_all_sources(env_file, svctl, monkeypatch):
+    """source 为空：一次返回全部支持分类的平台（含中文名）。"""
+    from proxy import platform_playlists as plpl
+
+    async def fake_cats(client, source):
+        return [{"id": f"{source}-1", "name": f"{source}分类", "group": "测试"}]
+
+    monkeypatch.setattr(plpl, "fetch_platform_categories", fake_cats)
+    webui._CATEGORY_CACHE.clear()
+    with authed_client() as client:
+        r = client.get("/api/playlist-categories")
+        assert r.status_code == 200
+        body = r.json()
+        assert set(body["categories"].keys()) == {"tx", "wy", "kw", "kg"}
+        assert body["platforms"]["tx"] == "QQ音乐"
+        assert body["categories"]["kg"][0]["id"] == "kg-1"
+
+
+def test_recommend_playlist_keys_documented_in_env_example():
+    """回归（v2.8.2）：SCHEMA 里的每个键都应在 .env.example 有对应行。
+
+    .env.example 是 install.sh 增量合并的 desired 来源；缺行虽不会删除已有值
+    （merge_env 会把它计入 custom_kept 保留），但新装用户拿不到该键的默认值与
+    注释，且「SCHEMA 有、example 无」说明该配置漏了对外文档 —— 本次
+    FNMUSIC_RECOMMEND_PLAYLIST_CATEGORY 就是这么漏掉的。
+    """
+    example = (HERE.parent / ".env.example").read_text(encoding="utf-8")
+    documented = {
+        line.split("=", 1)[0].strip()
+        for line in example.splitlines()
+        if "=" in line and not line.lstrip().startswith("#")
+    }
+    missing = sorted(k for k in webui.SCHEMA if k not in documented)
+    assert not missing, (
+        f"SCHEMA 中的键未在 .env.example 出现：{missing}。"
+        "请补上默认值与注释，否则新装用户看不到该配置。"
+    )

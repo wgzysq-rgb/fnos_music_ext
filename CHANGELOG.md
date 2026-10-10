@@ -5,6 +5,102 @@
 
 ## [Unreleased]
 
+## [2.8.3] - 2026-10-11
+
+### 修复
+
+- **修复 QQ 音乐（tx）歌单分类筛选完全失效**：用户选「国语」却出现
+  「日本福冈 CIRCLE ′18 音乐节」「新奥尔良爵士与传承音乐节」等与分类无关的内容。
+  - 根因：`platform_playlists._tx_recommend` 在指定分类时误用
+    `get_playlist_by_category`。实测该 method 的 `id`/`titleid` **根本不参与分类过滤**
+    —— 无论传什么 id，恒返回同一批固定歌单（`total` 恒为 **9**，恰好多为「音乐节」类），
+    所以看起来"有结果、但不随分类变"。
+  - 正解：统一走 **`get_playlist_by_tag` + `param.id = <分类id>`**。实测 `total` 随分类
+    正确变化（国语 **4812**、流行 **5325**、民谣 **830**、经典 **764**、KTV热歌 **218**），
+    返回内容与分类名一致（如「编辑推荐：国语热歌」「编辑推荐：国语新歌」）。
+    空分类仍为 `id=10000000`（全部），非数字分类安全退化为「全部」。
+  - 新增回归测试 `test_tx_recommend_uses_tag_method_with_category_id`：严格断言
+    指定分类时走 `by_tag`、分类 id 进入 `param.id`、且**不得**再出现
+    `get_playlist_by_category`；已实测该测试在旧实现下失败、修复后通过。
+    （替换掉原先那条 `"11" in url` 式过松、且断言了错误行为的测试。）
+
+## [2.8.2] - 2026-10-10
+
+### 修复
+
+- **修复 2.8.1 安装失败（构建上下文白名单漏放行）**：应用中心报
+  `ERROR: failed to calculate checksum ...: "/proxy/platform_playlists.py": not found`。
+  根因是 `.dockerignore` 首行 `*` 排除一切、再逐条 `!` 放行，2.8.1 只同步了
+  Dockerfile 的 COPY 清单，**忘了在 `.dockerignore` 里放行 `proxy/platform_playlists.py`**
+  → 该文件根本没进构建上下文，Docker 连 checksum 都算不出来。
+  - `.dockerignore` 补上 `!proxy/platform_playlists.py`，并注明它必须与
+    Dockerfile 的 `COPY ... /srv/proxy/` 清单保持一致。
+  - 新增回归测试 `container/test_container.py::test_proxy_modules_allowed_in_build_context`：
+    按 `.dockerignore` 的**逐行顺序语义**（`*` 排除 → `!` 放行 → `proxy/*` 再收窄）
+    求出生效白名单，再与 Dockerfile 实际要 COPY 的模块名对齐，任一缺失即失败；
+    同时反向检查"放行了却没人用"的冗余条目。
+
+  **为什么这两次（2.8.0 / 2.8.1）都栽在同一处**：`/srv/proxy/` 的模块分发要同时满足
+  **三个**位置一致 —— ① `webui-service/app.py` 的 import、② Dockerfile 的 COPY、
+  ③ `.dockerignore` 的白名单。前两次各补了一个，这次把三个都锁进测试了。
+
+## [2.8.1] - 2026-10-10
+
+### 修复
+
+- **修复 2.8.0 分类加载失败（镜像缺文件）**：容器内 WebUI 报「分类加载失败：分类模块不可用」。
+  根因是 `webui-service/app.py` 里的 `from proxy import platform_playlists` 在容器中
+  `ImportError`——镜像的 `/srv/proxy/` 只 COPY 了 `__init__.py` 与 `env_merge.py`，
+  而 `/repo` 只是挂载进来的仓库、**不在 sys.path 上**，因此容器里取不到
+  `platform_playlists`。
+  - `container/Dockerfile` 的 `/srv/proxy/` COPY 清单补上 `platform_playlists.py`。
+  - 该导入失败的兜底文案改为**原样带出异常信息**（原来只写「分类模块不可用」，
+    排查时无从下手）。
+  - 新增回归测试 `container/test_container.py::test_webui_proxy_imports_ship_in_image`：
+    解析 `webui-service/app.py` 里所有 `from proxy[.x] import ...`，
+    逐一核对 Dockerfile 是否 COPY 进 `/srv/proxy/`。
+    本机单测跑在仓库根目录、能 import 到完整 proxy 包，**"测试全绿但线上必炸"**
+    正是这次事故的形态，该断言专门堵这一类。
+
+## [2.8.0] - 2026-10-10
+
+### 新增
+
+- **平台歌单分类筛选**：设置页「平台推荐歌单（发现）」现支持按平台、按分类多选，
+  不再只有「全部」一档。
+  - **平台白名单由文本框改为勾选框**：QQ音乐 / 网易云 / 酷我 / 酷狗 / 咪咕 五个
+    平台一键勾选，全部不选 = 全部平台（与原行为一致）。
+  - **分类多选**：勾选平台后，其下按平台原生分组展示分类标签，可任意多选。
+    配置项 `FNMUSIC_RECOMMEND_PLAYLIST_CATEGORY`（csv，格式 `<平台>:<分类id>`，
+    如 `tx:11,tx:194,kg:12`），留空 = 各平台「全部」。
+  - **取数策略**：勾选多个分类时，每个分类各取 `recommend_playlist_page_size`
+    条后按歌单 id 合并去重（同一歌单可能挂在多个标签下）。
+  - 咪咕无分类体系（只有运营楼层），不参与分类筛选；其平台勾选仍有效。
+
+- **各平台分类接口接入**（`proxy/platform_playlists.py`，2026-10 实测）：
+  - **tx**：`c.y.qq.com/.../fcg_get_diss_tag_conf.fcg` 取官方分类树（6 组 60+ 分类）；
+    按分类取歌单改用 `get_playlist_by_category`（`get_playlist_by_tag` 不接受分类 id）。
+  - **kg**：`tag/list` 取父分类；取歌单前先经 `tag/info` 把分类 id 解析成
+    `special_tag_id`，再走 `tag/specialList`。
+  - **kw**：`getTagList` 取分类；按分类取歌单走 `getTagPlayList`。
+  - **wy**：`playlist/catlist` 已下线（404），分类名固化在内置表；
+    取歌单走 `playlist/list?cat=<中文分类名>`（实测 cat 参数有效）。
+  - 动态拉取失败一律回落内置兜底表，保证 UI 分类区不消失。
+
+- 新增代理端点 `GET /_ext/playlist-categories`（`source` 空则返回全部平台），
+  供 WebUI 与外部工具查询分类。
+- 新增 WebUI 端点 `GET /api/playlist-categories`（1 小时进程内缓存），
+  直接复用 `proxy.platform_playlists` 的分类逻辑，避免两处实现漂移。
+
+### 测试
+
+- `proxy/tests/test_discover_playlists.py` 新增 6 例：分类 csv 解析、
+  逐分类抓取合并去重、无分类时零行为变化、tx method 切换、兜底表回落、
+  分类平台范围。
+- `webui-service/test_webui.py` 新增 4 例：单平台分类、全平台分类、
+  不支持平台返回空、上游异常不 5xx。
+- `webui-service/test_app_js.js` 的平台歌单用例改为覆盖 chip 多选状态映射。
+
 ## [2.7.12] - 2026-10-10
 
 ### 修复
