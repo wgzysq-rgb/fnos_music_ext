@@ -150,14 +150,18 @@
           <label class="switch-row"><span>热门榜单推荐<div class="sub">独立「热门推荐」歌单：热歌榜/飙升榜原味</div></span><input type="checkbox" id="recommend-hot"></label>
           <label class="switch-row"><span>每日推荐<div class="sub">独立「每日推荐」歌单；其他音源在配置大模型后生效</div></span><input type="checkbox" id="recommend-daily"></label>
           <label class="switch-row"><span>平台推荐歌单（发现）<div class="sub">把各平台的推荐歌单注入歌单列表（与柠檬音乐「发现」同源：QQ 歌单广场 / 网易 / 酷我 / 酷狗 / 咪咕）。点进去听该平台歌单曲目，播放走已激活的洛雪源（需洛雪源处于激活状态）。属公共内容，不读个人历史与收藏。</div></span><input type="checkbox" id="recommend-playlist"></label>
-          <label class="field"><span>平台歌单·平台白名单</span>
-            <input class="input" id="recommend-playlist-source" type="text" placeholder="留空=全部（tx,wy,kw,kg,mg）">
-          </label>
-          <p class="hint">逗号分隔，可选 tx（QQ）/ wy（网易）/ kw（酷我）/ kg（酷狗）/ mg（咪咕）。留空即全部平台。</p>
+          <div class="field"><span>平台歌单·启用平台</span>
+            <div class="chip-grid" id="playlist-source-chips"></div>
+            <p class="hint">勾选要注入的平台。全部不选 = 全部平台（tx / wy / kw / kg / mg）。</p>
+          </div>
+          <div class="field" id="playlist-category-wrap"><span>平台歌单·分类筛选</span>
+            <div id="playlist-category-body"><p class="hint">正在加载分类…</p></div>
+            <p class="hint">按平台勾选分类，留空 = 该平台「全部」。勾选多个分类时，每个分类各取下方数量的歌单后合并去重。咪咕无分类体系，不受此设置影响。</p>
+          </div>
           <label class="field"><span>平台歌单·每平台数量</span>
             <input class="input" id="recommend-playlist-size" type="number" min="1" max="30" step="1" inputmode="numeric">
           </label>
-          <p class="hint">每个平台取多少张推荐歌单卡，默认 12。歌单列表会被这些卡片填充，觉得太多可调小。保存后代理热重载生效。</p>
+          <p class="hint">每个平台（或每个分类）取多少张推荐歌单卡，默认 12。歌单列表会被这些卡片填充，觉得太多可调小。保存后代理热重载生效。</p>
         </div>
       </section>
 

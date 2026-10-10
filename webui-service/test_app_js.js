@@ -258,22 +258,26 @@ test("平台推荐歌单开关：loadConfig 回填 + collectConfig 收集", asyn
   enqueue("/app/fnmusic-ext/api/config", { values: {
     FNMUSIC_RECOMMEND_PLAYLIST: "true",
     FNMUSIC_RECOMMEND_PLAYLIST_SOURCE: "wy,kg",
+    FNMUSIC_RECOMMEND_PLAYLIST_CATEGORY: "kg:12,wy:古风",
     FNMUSIC_RECOMMEND_PLAYLIST_PAGE_SIZE: "8",
   } });
   await global.loadConfig();
   assert.strictEqual(els.get("#recommend-playlist").checked, true);
-  assert.strictEqual(els.get("#recommend-playlist-source").value, "wy,kg");
   assert.strictEqual(els.get("#recommend-playlist-size").value, "8");
+  // 平台/分类走 chip 多选（不再有文本输入框），这里以 collectConfig 的输出为契约
   const collected = global.collectConfig();
   assert.strictEqual(collected.FNMUSIC_RECOMMEND_PLAYLIST, true);
   assert.strictEqual(collected.FNMUSIC_RECOMMEND_PLAYLIST_SOURCE, "wy,kg");
+  assert.strictEqual(collected.FNMUSIC_RECOMMEND_PLAYLIST_CATEGORY, "kg:12,wy:古风");
   assert.strictEqual(collected.FNMUSIC_RECOMMEND_PLAYLIST_PAGE_SIZE, 8);
-  // 缺省（默认关 / 全平台 / 12）表现
+  // 缺省（默认关 / 全平台 / 无分类 / 12）表现
   reset();
   enqueue("/app/fnmusic-ext/api/config", { values: {} });
   await global.loadConfig();
   assert.strictEqual(els.get("#recommend-playlist").checked, false);
-  assert.strictEqual(els.get("#recommend-playlist-source").value, "");
+  const fallback = global.collectConfig();
+  assert.strictEqual(fallback.FNMUSIC_RECOMMEND_PLAYLIST_SOURCE, "");
+  assert.strictEqual(fallback.FNMUSIC_RECOMMEND_PLAYLIST_CATEGORY, "");
   assert.strictEqual(els.get("#recommend-playlist-size").value, "12");
 });
 

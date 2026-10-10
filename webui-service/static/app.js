@@ -10,6 +10,16 @@ const $$ = (sel) => Array.from(document.querySelectorAll(sel));
 
 const PROVIDER_LABEL = { musicdl: "musicdl 聚合音源", musicbox: "网易云音乐盒子", lxmusic: "洛雪自定义源", none: "未配置" };
 const PROC_LABEL = { musicdl: "musicdl", musicbox: "musicbox", lxmusic: "lxmusic", webui: "WebUI" };
+const PLATFORM_LABEL = { tx: "QQ音乐", wy: "网易云", kw: "酷我", kg: "酷狗", mg: "咪咕" };
+const ALL_PLATFORMS = ["tx", "wy", "kw", "kg", "mg"];
+const CATEGORY_PLATFORMS = ["tx", "wy", "kw", "kg"];  // 咪咕无分类体系
+
+// 平台歌单设置的多选状态（与 .env 的 csv 字段双向映射）
+const state = {
+  playlistSource: [],     // 选中的平台 code，如 ["tx","kg"]；空 = 全部
+  playlistCategory: [],   // 选中的分类，形如 ["tx:11","kg:12"]
+  categoryData: null,     // /api/playlist-categories 的返回（懒加载一次）
+};
 
 let configValues = {};   // GET /api/config 的 values
 let platforms = { enabled: [], registered: [] };
@@ -117,7 +127,10 @@ function applyConfigToForm() {
   $("#recommend-hot").checked = v.FNMUSIC_RECOMMEND_HOT === "true";
   $("#recommend-daily").checked = v.FNMUSIC_RECOMMEND_DAILY === "true";
   $("#recommend-playlist").checked = v.FNMUSIC_RECOMMEND_PLAYLIST === "true";
-  $("#recommend-playlist-source").value = v.FNMUSIC_RECOMMEND_PLAYLIST_SOURCE || "";
+  state.playlistSource = splitCsv(v.FNMUSIC_RECOMMEND_PLAYLIST_SOURCE);
+  state.playlistCategory = splitCsv(v.FNMUSIC_RECOMMEND_PLAYLIST_CATEGORY);
+  renderSourceChips();
+  ensureCategoryData().then(renderCategoryChips);
   $("#recommend-playlist-size").value = v.FNMUSIC_RECOMMEND_PLAYLIST_PAGE_SIZE || "12";
   $("#tee-enabled").checked = v.FNMUSIC_TEE_SAVE_ENABLED === "true";
   $("#auto-cover").checked = v.FNMUSIC_AUTO_COVER !== "false";
@@ -174,7 +187,8 @@ function collectConfig() {
     FNMUSIC_RECOMMEND_HOT: $("#recommend-hot").checked,
     FNMUSIC_RECOMMEND_DAILY: $("#recommend-daily").checked,
     FNMUSIC_RECOMMEND_PLAYLIST: $("#recommend-playlist").checked,
-    FNMUSIC_RECOMMEND_PLAYLIST_SOURCE: $("#recommend-playlist-source").value.trim(),
+    FNMUSIC_RECOMMEND_PLAYLIST_SOURCE: state.playlistSource.join(","),
+    FNMUSIC_RECOMMEND_PLAYLIST_CATEGORY: state.playlistCategory.join(","),
     FNMUSIC_RECOMMEND_PLAYLIST_PAGE_SIZE: parseInt($("#recommend-playlist-size").value || "12", 10) || 12,
     FNMUSIC_TEE_SAVE_ENABLED: $("#tee-enabled").checked,
     FNMUSIC_AUTO_COVER: $("#auto-cover").checked,
@@ -311,6 +325,102 @@ async function loadPlatforms(autoPreview = true) {
       setPlatformFallback();
     }
   }
+}
+
+/* ------------------------------------------- 平台歌单：平台 / 分类多选 chip */
+
+function splitCsv(raw) {
+  return String(raw || "")
+    .replace(/，/g, ",")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
+function renderSourceChips() {
+  const box = $("#playlist-source-chips");
+  if (!box) return;
+  const on = new Set(state.playlistSource);
+  box.innerHTML = ALL_PLATFORMS
+    .map((p) => `<span class="chip ${on.has(p) ? "on" : ""}" data-src="${p}">${PLATFORM_LABEL[p]}<small>${p}</small></span>`)
+    .join("");
+  box.querySelectorAll(".chip[data-src]").forEach((chip) =>
+    chip.addEventListener("click", () => {
+      const p = chip.dataset.src;
+      const set = new Set(state.playlistSource);
+      if (set.has(p)) set.delete(p); else set.add(p);
+      state.playlistSource = ALL_PLATFORMS.filter((x) => set.has(x));
+      // 取消平台时，顺手清掉该平台已选分类，避免残留无效配置
+      if (!set.has(p)) {
+        state.playlistCategory = state.playlistCategory.filter((c) => !c.startsWith(p + ":"));
+      }
+      renderSourceChips();
+      renderCategoryChips();
+      markDirty("平台歌单已修改");
+    }));
+}
+
+async function ensureCategoryData() {
+  if (state.categoryData) return state.categoryData;
+  try {
+    state.categoryData = await api("/api/playlist-categories");
+  } catch (err) {
+    state.categoryData = { ok: false, categories: {}, error: String(err && err.message || err) };
+  }
+  return state.categoryData;
+}
+
+function renderCategoryChips() {
+  const body = $("#playlist-category-body");
+  if (!body) return;
+  const data = state.categoryData;
+  if (!data) { body.innerHTML = `<p class="hint">正在加载分类…</p>`; return; }
+  if (data.ok === false && !Object.keys(data.categories || {}).length) {
+    body.innerHTML = `<p class="hint">分类加载失败：${data.error || "未知错误"}（不影响保存，留空即全部）</p>`;
+    return;
+  }
+  // 平台选择为空 = 全部平台 → 展示所有有分类的平台
+  const active = state.playlistSource.length
+    ? state.playlistSource.filter((p) => CATEGORY_PLATFORMS.includes(p))
+    : CATEGORY_PLATFORMS.slice();
+  if (!active.length) {
+    body.innerHTML = `<p class="hint">所选平台均无分类体系（咪咕不支持分类），无需设置。</p>`;
+    return;
+  }
+  const on = new Set(state.playlistCategory);
+  const blocks = active.map((p) => {
+    const cats = (data.categories || {})[p] || [];
+    if (!cats.length) {
+      return `<div class="cat-block"><div class="cat-head">${PLATFORM_LABEL[p] || p}<small>${p}</small></div>
+        <p class="hint">该平台分类暂不可用</p></div>`;
+    }
+    // 按 group 分组渲染，保留平台原生分类体系
+    const groups = [];
+    cats.forEach((c) => {
+      const g = c.group || "分类";
+      let slot = groups.find((x) => x.name === g);
+      if (!slot) { slot = { name: g, items: [] }; groups.push(slot); }
+      slot.items.push(c);
+    });
+    const inner = groups.map((g) => `
+      <div class="cat-group"><span class="cat-group-name">${g.name}</span>
+        <div class="chip-grid">${g.items.map((c) => {
+          const key = `${p}:${c.id}`;
+          return `<span class="chip ${on.has(key) ? "on" : ""}" data-cat="${key}">${c.name}</span>`;
+        }).join("")}</div>
+      </div>`).join("");
+    return `<div class="cat-block"><div class="cat-head">${PLATFORM_LABEL[p] || p}<small>${p}</small></div>${inner}</div>`;
+  });
+  body.innerHTML = blocks.join("");
+  body.querySelectorAll(".chip[data-cat]").forEach((chip) =>
+    chip.addEventListener("click", () => {
+      const key = chip.dataset.cat;
+      const set = new Set(state.playlistCategory);
+      if (set.has(key)) set.delete(key); else set.add(key);
+      state.playlistCategory = Array.from(set);
+      chip.classList.toggle("on");
+      markDirty("歌单分类已修改");
+    }));
 }
 
 function renderPlatformChips() {
@@ -692,7 +802,7 @@ if ($("#lx-name")) {
 $$("input[name=quality]").forEach((el) => el.addEventListener("change", () => markDirty("音质偏好需保存后生效")));
 ["#recommend-hot", "#recommend-daily", "#recommend-playlist", "#search-probe", "#search-deep", "#tee-enabled", "#fav-autobind", "#auto-cover", "#lyric-auto-dl", "#netease-my-playlists"].forEach((sel) =>
   $(sel).addEventListener("change", () => markDirty()));
-["#recommend-playlist-source", "#recommend-playlist-size"].forEach((sel) =>
+["#recommend-playlist-size"].forEach((sel) =>
   $(sel).addEventListener("input", () => markDirty()));
 
 function updateTeeCountLabel() {
