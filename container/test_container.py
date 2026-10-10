@@ -277,6 +277,118 @@ def test_dockerfile_assembly():
     assert "chmod 0644 /etc/supervisor/supervisord.conf" in text
 
 
+def _copied_proxy_modules(text: str) -> set[str]:
+    """从 Dockerfile 里收集 COPY 进 /srv/proxy/ 的 proxy 模块名。
+
+    形如 `COPY --chown=... proxy/__init__.py proxy/env_merge.py /srv/proxy/`
+    → {"__init__", "env_merge"}。只认目标为 /srv/proxy/ 的那条（可能跨行续行）。
+    """
+    out: set[str] = set()
+    # 先把续行拼成单行，避免 COPY 写成多行时漏解析
+    joined = re.sub(r"\\\s*\n\s*", " ", text)
+    for line in joined.splitlines():
+        line = line.strip()
+        if not line.upper().startswith("COPY"):
+            continue
+        if "/srv/proxy/" not in line:
+            continue
+        for tok in line.split()[1:]:
+            m = re.fullmatch(r"proxy/(.+)\.py", tok)
+            if m:
+                out.add(m.group(1))
+    return out
+
+
+def test_webui_proxy_imports_ship_in_image():
+    """回归（v2.8.0 事故）：webui-service 里 `from proxy import X` 的每个模块
+    都必须在 Dockerfile 中 COPY 到 /srv/proxy/。
+
+    背景：webui 在容器内跑，`/repo` 只是挂载进来的仓库、**不在 sys.path 上**；
+    它能 import 的 `proxy` 包就是镜像里烤进去的 /srv/proxy/。
+    v2.8.0 时该目录只有 __init__.py + env_merge.py，而新代码里写了
+    `from proxy import platform_playlists` → ModuleNotFoundError 被兜底 except
+    吞掉 → 设置页「分类加载失败」。本机跑测试时仓库根目录能 import 到完整的
+    proxy 包，所以单测全绿却线上必炸 —— 这个断言就是为了堵住这类"测试绿、线上炸"。
+    """
+    text = (CONTAINER_DIR / "Dockerfile").read_text(encoding="utf-8")
+    shipped = _copied_proxy_modules(text)
+    assert shipped, "Dockerfile 里没有解析到任何 COPY ... /srv/proxy/，解析逻辑或文件已变"
+
+    src = (REPO_ROOT / "webui-service" / "app.py").read_text(encoding="utf-8")
+    # 两种写法都要覆盖：`from proxy import x` 与 `from proxy.x import y`
+    needed = set(re.findall(r"^\s*from\s+proxy\s+import\s+(\w+)", src, re.M))
+    needed |= set(re.findall(r"^\s*from\s+proxy\.(\w+)\s+import", src, re.M))
+    assert needed, "没解析到 webui 对 proxy 的导入，正则或源码结构已变"
+
+    missing = sorted(m for m in needed if m not in shipped)
+    assert not missing, (
+        f"webui-service/app.py 导入了 proxy.{{{','.join(missing)}}}，"
+        f"但 Dockerfile 未 COPY 进 /srv/proxy/（已分发：{sorted(shipped)}）。"
+        "容器内 /repo 不在 sys.path 上，缺一个就 import 失败。"
+    )
+    # 每个已分发的 proxy 模块必须在仓库里真实存在
+    for name in sorted(shipped):
+        assert (REPO_ROOT / "proxy" / f"{name}.py").is_file(), f"proxy/{name}.py 不存在"
+
+
+def test_proxy_modules_allowed_in_build_context():
+    """回归（v2.8.1 真实事故）：Dockerfile 要 COPY 的每个 proxy 模块，
+    必须在 .dockerignore 的白名单里被显式放行。
+
+    背景：.dockerignore 第一行是 `*`（排除一切），然后逐个 `!` 放行。
+    v2.8.1 我只改了 Dockerfile 的 COPY 清单，忘了同步放行
+    `proxy/platform_playlists.py` → 构建期报
+    `failed to calculate checksum ...: "/proxy/platform_playlists.py": not found`
+    （文件根本不在构建上下文里，Docker 连 checksum 都算不出来）。
+    注意镜像构建用了 `build.network: host` / 本地镜像，所以这个错误跟网络无关，
+    极易被日志末尾那串"换源/配代理"提示误导。
+    """
+    text = (CONTAINER_DIR / "Dockerfile").read_text(encoding="utf-8")
+    shipped = _copied_proxy_modules(text)
+    assert shipped, "Dockerfile 里没解析到 COPY ... /srv/proxy/"
+
+    ig_lines = (REPO_ROOT / ".dockerignore").read_text(encoding="utf-8").splitlines()
+
+    # 按顺序求值：`*` 先排除一切，后面的 `!` 逐条放行；目录被排除后无法再包含子文件
+    allowed: set[str] = set()
+    excluded = True  # 默认被首行 `*` 排除
+    for raw in ig_lines:
+        s = raw.strip()
+        if not s or s.startswith("#"):
+            continue
+        negate = s.startswith("!")
+        pat = s[1:] if negate else s
+        if pat == "*":
+            excluded = not negate
+            continue
+        # 目录级：!proxy/ → 目录本身进入上下文，但内部文件仍受 `proxy/*` 约束
+        if pat.endswith("/"):
+            continue
+        # 只关心 proxy/ 下的显式文件名；`proxy/*` 这类通配由 excluded 状态表达
+        m = re.fullmatch(r"proxy/(.+)", pat)
+        if m and "*" not in m.group(1):
+            if negate:
+                allowed.add(m.group(1))
+            else:
+                allowed.discard(m.group(1))
+            continue
+        if pat.startswith("proxy/*"):
+            # `proxy/*` 排除 proxy 下全部条目（与首行 `*` 同效）
+            if not negate:
+                excluded = True
+
+    missing = sorted(m for m in shipped if f"{m}.py" not in allowed)
+    assert not missing, (
+        f"Dockerfile 要 COPY proxy/{{{','.join(m + '.py' for m in missing)}}} 进镜像，"
+        f"但 .dockerignore 未放行这些文件（已放行：{sorted(allowed)}）。"
+        "文件不在构建上下文里 → "
+        "`failed to calculate checksum ...: not found`，与网络无关。"
+    )
+    # 反向：放行了却没人用，属于冗余白名单（保留也无害，但提示清理）
+    unused = sorted(a for a in allowed if a not in {f"{m}.py" for m in shipped})
+    assert not unused, f".dockerignore 放行了未被 Dockerfile 使用的 proxy 文件：{unused}"
+
+
 def test_dockerfile_network_fallback_resilience():
     """构建容器网络自愈：始终注入备用公共 DNS；apt 回退看索引落地而非退出码；pip 回退官方源。
 

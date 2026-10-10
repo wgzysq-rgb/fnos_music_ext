@@ -5,11 +5,15 @@
 !lxmusic-service/
 !webui-service/
 !container/
-# webui 复用 .env 安全合并模块：只放行这两个文件（目录先放行再收窄，父目录被排除时无法重新包含）
+# webui 复用 proxy 模块：.env 安全合并（env_merge）+ 歌单分类（platform_playlists）。
+# 只放行用到的这几个文件（目录先放行再收窄，父目录被排除时无法重新包含）。
+# 注意：这里放行哪些文件，必须与 Dockerfile 里 `COPY ... /srv/proxy/` 的清单**保持一致**，
+# 少一个就会在构建期报 `failed to calculate checksum ... : not found`（v2.8.1 真实事故）。
 !proxy/
 proxy/*
 !proxy/__init__.py
 !proxy/env_merge.py
+!proxy/platform_playlists.py
 **/__pycache__/
 **/*.pyc
 **/.pytest_cache/

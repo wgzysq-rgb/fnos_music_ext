@@ -177,8 +177,10 @@ COPY --chown=appuser:appuser musicbox-service/app.py musicbox-service/runner.py 
 COPY --chown=appuser:appuser lxmusic-service/app.py lxmusic-service/lxserver_client.py lxmusic-service/verify_source.py /srv/lxmusic-service/
 COPY --chown=appuser:appuser webui-service/app.py /srv/webui-service/
 COPY --chown=appuser:appuser webui-service/static/ /srv/webui-service/static/
-# webui 复用 .env 安全合并（sys.path 上加 /srv 后 import proxy.env_merge），必须随镜像分发
-COPY --chown=appuser:appuser proxy/__init__.py proxy/env_merge.py /srv/proxy/
+# webui 复用 .env 安全合并（sys.path 上加 /srv 后 import proxy.env_merge）与歌单分类
+# （import proxy.platform_playlists），这些模块必须随镜像分发。
+# 注意：/repo 只是挂载进来的仓库，不在 sys.path 上，所以不能指望从那里 import。
+COPY --chown=appuser:appuser proxy/__init__.py proxy/env_merge.py proxy/platform_playlists.py /srv/proxy/
 RUN find /srv -name "*.py" -exec chmod 0644 {} + \
     && mkdir -p /repo \
     && chmod 0755 /repo /data
