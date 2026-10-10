@@ -74,7 +74,7 @@ SCHEMA: dict[str, dict] = {
     "FNMUSIC_RECOMMEND_HOT": {"kind": "bool", "default": "true", "group": "recommend", "reload": "hot", "label": "热门榜单推荐"},
     "FNMUSIC_RECOMMEND_DAILY": {"kind": "bool", "default": "true", "group": "recommend", "reload": "hot", "label": "每日推荐"},
     "FNMUSIC_RECOMMEND_PLAYLIST": {"kind": "bool", "default": "false", "group": "recommend", "reload": "hot", "label": "平台推荐歌单（发现）"},
-    "FNMUSIC_RECOMMEND_PLAYLIST_SOURCE": {"kind": "csv", "default": "", "group": "recommend", "reload": "hot", "label": "平台歌单平台白名单（空=全部）"},
+    "FNMUSIC_RECOMMEND_PLAYLIST_SOURCE": {"kind": "csv", "default": "", "group": "recommend", "reload": "hot", "label": "平台歌单平台白名单（空=不注入任何平台）"},
     "FNMUSIC_RECOMMEND_PLAYLIST_PAGE_SIZE": {"kind": "int", "default": "12", "min": 1, "max": 30, "group": "recommend", "reload": "hot", "label": "每平台歌单数量"},
     "FNMUSIC_RECOMMEND_PLAYLIST_CATEGORY": {"kind": "csv", "default": "", "group": "recommend", "reload": "hot", "label": "歌单分类（格式 平台:分类id）"},
     "FNMUSIC_TEE_SAVE_ENABLED": {"kind": "bool", "default": "true", "group": "tee", "reload": "hot", "label": "边听边存"},

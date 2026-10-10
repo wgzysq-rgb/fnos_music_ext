@@ -194,7 +194,7 @@ CONF = {
     "recommend_daily": os.environ.get("FNMUSIC_RECOMMEND_DAILY", "true").lower() in ("true", "1", "yes"),
     # 发现·歌单广场（2.8.0）：把各平台推荐歌单注入音乐页歌单列表，默认关。
     # platform_playlist 开关本体；recommend_playlist_source 指定平台（csv，
-    # 空=全部平台）；recommend_playlist_page_size 每平台注入多少张歌单卡。
+    # **空=一个都不注入**，v2.8.4 起）；recommend_playlist_page_size 每平台注入多少张。
     "recommend_playlist": os.environ.get("FNMUSIC_RECOMMEND_PLAYLIST", "false").lower() in ("true", "1", "yes"),
     "recommend_playlist_source": (os.environ.get("FNMUSIC_RECOMMEND_PLAYLIST_SOURCE") or "").strip().lower(),
     "recommend_playlist_page_size": max(1, min(30, int(os.environ.get("FNMUSIC_RECOMMEND_PLAYLIST_PAGE_SIZE", "12") or 12))),
@@ -7318,9 +7318,15 @@ def _discover_enabled() -> bool:
 
 
 def _discover_sources() -> list[str]:
-    """要注入的平台列表：受白名单约束；空=全部受支持平台。"""
+    """要注入的平台列表：仅取白名单里显式勾选的平台。
+
+    **空 = 不注入任何平台**（v2.8.4 起，与总开关语义对齐）。
+    历史行为是「空 = 全部受支持平台」，但那样用户无法表达「一个平台都不要」——
+    在 UI 里把平台全部取消勾选，反而会注入全部 5 个平台，与「取消」意图相反。
+    真正要「全都要」的用户请显式勾选全部平台（UI 提供了全选入口）。
+    """
     raw = str(CONF.get("recommend_playlist_source") or "").strip()
-    wanted = [s.strip() for s in raw.split(",") if s.strip()] if raw else list(plpl.SUPPORTED_PLATFORMS)
+    wanted = [s.strip() for s in raw.split(",") if s.strip()]
     return [s for s in wanted if s in plpl.SUPPORTED_PLATFORMS]
 
 

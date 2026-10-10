@@ -45,7 +45,9 @@ def setup_discover_env(tmp_path, monkeypatch):
     monkeypatch.setitem(CONF, "recommend_daily", False)
     monkeypatch.setitem(CONF, "recommend_hot", False)
     monkeypatch.setitem(CONF, "recommend_playlist", True)
-    monkeypatch.setitem(CONF, "recommend_playlist_source", "")
+    # v2.8.4 起空 = 不注入，故测试显式启用全部平台，保持「有注入」的测试前提
+    # （各用例仍可自行覆盖 source 以验证白名单过滤）
+    monkeypatch.setitem(CONF, "recommend_playlist_source", ",".join(plpl.SUPPORTED_PLATFORMS))
     monkeypatch.setitem(CONF, "recommend_playlist_page_size", 12)
     # lxmusic 客户端默认 mock（404），防测试触达真实 127.0.0.1:8772
     app.state.lx_client = httpx.AsyncClient(
@@ -438,12 +440,20 @@ def test_discover_source_whitelist(monkeypatch):
                     if dailyrec.is_discover_playlist_guid(str(it.get("guid") or ""))]
 
 
-def test_discover_sources_defaults_to_all_supported(monkeypatch):
+def test_discover_sources_empty_means_none(monkeypatch):
+    """回归（v2.8.4）：平台白名单为空 = 不注入任何平台（不再等于「全部平台」）。
+
+    历史行为是「空 = 全部受支持平台」，导致用户在 UI 里取消所有平台勾选后，
+    反而注入全部 5 个平台、与「取消」意图相反。现与总开关语义对齐。
+    """
     from proxy.app import _discover_sources
     monkeypatch.setitem(CONF, "recommend_playlist_source", "")
-    assert _discover_sources() == list(plpl.SUPPORTED_PLATFORMS)
+    assert _discover_sources() == []
+    # 显式勾选才注入；非法值被过滤
     monkeypatch.setitem(CONF, "recommend_playlist_source", "bogus,wy,")
     assert _discover_sources() == ["wy"]
+    monkeypatch.setitem(CONF, "recommend_playlist_source", "tx,kg,mg")
+    assert _discover_sources() == ["tx", "kg", "mg"]
 
 
 # ------------------------------------------------- 歌单名不再退化为通用名 --

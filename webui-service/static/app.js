@@ -16,7 +16,7 @@ const CATEGORY_PLATFORMS = ["tx", "wy", "kw", "kg"];  // 咪咕无分类体系
 
 // 平台歌单设置的多选状态（与 .env 的 csv 字段双向映射）
 const state = {
-  playlistSource: [],     // 选中的平台 code，如 ["tx","kg"]；空 = 全部
+  playlistSource: [],     // 选中的平台 code，如 ["tx","kg"]；空 = 不注入任何平台
   playlistCategory: [],   // 选中的分类，形如 ["tx:11","kg:12"]
   categoryData: null,     // /api/playlist-categories 的返回（懒加载一次）
 };
@@ -131,6 +131,7 @@ function applyConfigToForm() {
   state.playlistCategory = splitCsv(v.FNMUSIC_RECOMMEND_PLAYLIST_CATEGORY);
   renderSourceChips();
   ensureCategoryData().then(renderCategoryChips);
+  updatePlaylistDetailVisibility();
   $("#recommend-playlist-size").value = v.FNMUSIC_RECOMMEND_PLAYLIST_PAGE_SIZE || "12";
   $("#tee-enabled").checked = v.FNMUSIC_TEE_SAVE_ENABLED === "true";
   $("#auto-cover").checked = v.FNMUSIC_AUTO_COVER !== "false";
@@ -337,6 +338,15 @@ function splitCsv(raw) {
     .filter(Boolean);
 }
 
+function updatePlaylistDetailVisibility() {
+  // 总开关（平台推荐歌单）关闭时，隐藏平台/分类/数量这些细节设置，
+  // 避免用户误以为「取消所有平台勾选」就能关闭功能。
+  const wrap = $("#playlist-detail-wrap");
+  const sw = $("#recommend-playlist");
+  if (!wrap || !wrap.style || !sw) return;
+  wrap.style.display = sw.checked ? "" : "none";
+}
+
 function renderSourceChips() {
   const box = $("#playlist-source-chips");
   if (!box) return;
@@ -376,13 +386,15 @@ function renderCategoryChips() {
   const data = state.categoryData;
   if (!data) { body.innerHTML = `<p class="hint">正在加载分类…</p>`; return; }
   if (data.ok === false && !Object.keys(data.categories || {}).length) {
-    body.innerHTML = `<p class="hint">分类加载失败：${data.error || "未知错误"}（不影响保存，留空即全部）</p>`;
+    body.innerHTML = `<p class="hint">分类加载失败：${data.error || "未知错误"}（不影响保存，留空即该平台「全部」）</p>`;
     return;
   }
-  // 平台选择为空 = 全部平台 → 展示所有有分类的平台
-  const active = state.playlistSource.length
-    ? state.playlistSource.filter((p) => CATEGORY_PLATFORMS.includes(p))
-    : CATEGORY_PLATFORMS.slice();
+  // 只展示「已勾选平台」的分类；未勾选任何平台 = 不注入，不展示分类
+  if (!state.playlistSource.length) {
+    body.innerHTML = `<p class="hint">未勾选任何平台 —— 不会注入任何推荐歌单，无需设置分类。</p>`;
+    return;
+  }
+  const active = state.playlistSource.filter((p) => CATEGORY_PLATFORMS.includes(p));
   if (!active.length) {
     body.innerHTML = `<p class="hint">所选平台均无分类体系（咪咕不支持分类），无需设置。</p>`;
     return;
@@ -802,6 +814,7 @@ if ($("#lx-name")) {
 $$("input[name=quality]").forEach((el) => el.addEventListener("change", () => markDirty("音质偏好需保存后生效")));
 ["#recommend-hot", "#recommend-daily", "#recommend-playlist", "#search-probe", "#search-deep", "#tee-enabled", "#fav-autobind", "#auto-cover", "#lyric-auto-dl", "#netease-my-playlists"].forEach((sel) =>
   $(sel).addEventListener("change", () => markDirty()));
+$("#recommend-playlist").addEventListener("change", updatePlaylistDetailVisibility);
 ["#recommend-playlist-size"].forEach((sel) =>
   $(sel).addEventListener("input", () => markDirty()));
 
