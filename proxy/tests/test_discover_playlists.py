@@ -712,3 +712,148 @@ def test_discover_conf_keys_cover_recommend_config():
         "recommend_playlist", "recommend_playlist_source",
         "recommend_playlist_page_size", "recommend_playlist_category",
     } <= appmod._DISCOVER_CONF_KEYS
+
+
+def test_kg_recommend_parent_group_returns_empty(monkeypatch):
+    """kg 纯分组节点（special_tag_id=0，如 153 专区）必须返回空，不回落通用热门。
+
+    背景：原实现分类取不到时 `return await _kg_recommend(...,"")` 回落通用热门，
+    导致用户「选了某分类却出现无关歌单」。实测 153/1599/2009/2005/2007/2003/
+    1263/2011 这些分组 special_tag_id 全为 0 且 tag/list 下钻为空 → 本身无歌单。
+    """
+    async def fake_get(client, url, headers=None):
+        # tag/info 返回 special_tag_id=0（纯分组）
+        if "tag/info" in url:
+            return {"data": {"special_tag_id": 0}}
+        # specialList 返回空
+        if "specialList" in url:
+            return {"data": {"total": 0, "info": []}}
+        return {}
+
+    monkeypatch.setattr(plpl, "_get", fake_get)
+    import asyncio
+    cards = asyncio.run(plpl._kg_recommend(None, "recommend", 1, 2, "153"))
+    assert cards == []
+
+
+def test_kg_recommend_leaf_category_uses_special_tag_id(monkeypatch):
+    """kg 真·叶子分类（如 34 80后 → special_tag_id=14）要用解析出的 tagid 取歌单。"""
+    captured = {}
+
+    async def fake_get(client, url, headers=None):
+        if "tag/info" in url:
+            return {"data": {"special_tag_id": 14}}
+        if "specialList" in url:
+            captured["url"] = url
+            return {"data": {"total": 100, "info": [
+                {"specialid": "999", "specialname": "80后经典", "play_count": 12,
+                 "songcount": 30},
+            ]}}
+        return {}
+
+    monkeypatch.setattr(plpl, "_get", fake_get)
+    import asyncio
+    cards = asyncio.run(plpl._kg_recommend(None, "recommend", 1, 2, "34"))
+    assert "tagid=14" in captured["url"] and "id=34" in captured["url"]
+    assert cards and cards[0]["name"] == "80后经典" and cards[0]["id"] == "id_999"
+
+
+def test_kg_categories_filters_empty_groups(monkeypatch):
+    """kg 分类表要剔除无歌单的分组节点，只留有内容/有子项的分类。"""
+    async def fake_get(client, url, headers=None):
+        if "tag/list" in url:
+            return {"data": {"info": [
+                {"id": 153, "name": "专区", "children": []},          # 无内容 → 剔除
+                {"id": 32, "name": "年龄", "children": [
+                    {"id": 34, "name": "80后"}, {"id": 35, "name": "90后"},
+                ]},                                                    # 有子项 → 展开
+            ]}}
+        if "tag/info" in url:
+            # 只有 153 会被探测（无子项），返回 0 表示无内容
+            return {"data": {"special_tag_id": 0}}
+        return {}
+
+    monkeypatch.setattr(plpl, "_get", fake_get)
+    import asyncio
+    cats = asyncio.run(plpl._kg_categories(None))
+    ids = [c["id"] for c in cats]
+    assert "153" not in ids            # 空分组被剔除
+    assert ids == ["34", "35"]         # 年龄的子项展开
+    names = {c["id"]: c["name"] for c in cats}
+    assert names["34"] == "80后" and names["35"] == "90后"
+
+
+def test_kw_recommend_uses_category_digest(monkeypatch):
+    """kw 取歌单要用分类自身的 digest（专区组=43、其它=10000），不能硬编码。"""
+    captured = {}
+
+    async def fake_get(client, url, headers=None):
+        if "getTagList" in url:
+            return {"data": [
+                {"name": "专区", "data": [{"id": 147, "name": "K歌专区", "digest": 43}]},
+                {"name": "曲风流派", "data": [{"id": 393, "name": "流行", "digest": 10000}]},
+            ]}
+        if "getTagPlayList" in url:
+            captured["url"] = url
+            return {"data": {"data": [
+                {"id": "p1", "name": "歌单1", "digest": "8", "uname": "", "img": "",
+                 "listencnt": 1, "total": 5, "desc": ""},
+            ]}}
+        return {}
+
+    monkeypatch.setattr(plpl, "_get", fake_get)
+    import asyncio
+    asyncio.run(plpl._kw_recommend(None, "hot", 1, 2, "147"))
+    assert "digest=43" in captured["url"], captured["url"]
+
+    asyncio.run(plpl._kw_recommend(None, "hot", 1, 2, "393"))
+    assert "digest=10000" in captured["url"], captured["url"]
+
+
+def test_kw_recommend_unknown_category_falls_back_digest(monkeypatch):
+    """分类表里查不到的 id → digest 回落 10000（不抛异常）。"""
+    captured = {}
+
+    async def fake_get(client, url, headers=None):
+        if "getTagList" in url:
+            return {"data": []}
+        if "getTagPlayList" in url:
+            captured["url"] = url
+        return {}
+
+    monkeypatch.setattr(plpl, "_get", fake_get)
+    import asyncio
+    asyncio.run(plpl._kw_recommend(None, "hot", 1, 2, "99999"))
+    assert "digest=10000" in captured["url"]
+
+
+def test_kw_categories_filters_empty_and_dedupes(monkeypatch):
+    """kw 分类表要剔除无内容分类，并对同 id 冲突取最后定义（不重复列出）。"""
+    async def fake_get(client, url, headers=None):
+        if "getTagList" in url:
+            return {"data": [
+                {"name": "专区", "data": [
+                    {"id": 211, "name": "经典老歌专区", "digest": 43},   # 空 → 剔除
+                    {"id": 13, "name": "轻音乐专区", "digest": 43},      # 与语言组冲突
+                ]},
+                {"name": "语言", "data": [
+                    {"id": 13, "name": "粤语", "digest": 10000},         # 同 id，最后定义生效
+                    {"id": 37, "name": "华语", "digest": 10000},         # 有内容 → 保留
+                ]},
+            ]}
+        if "getTagPlayList" in url:
+            # 211 空；13/37 有内容
+            if "id=211" in url:
+                return {"data": {"data": []}}
+            return {"data": {"data": [{"id": "x", "name": "x"}]}}
+        return {}
+
+    monkeypatch.setattr(plpl, "_get", fake_get)
+    import asyncio
+    cats = asyncio.run(plpl._kw_categories(None))
+    ids = [c["id"] for c in cats]
+    assert "211" not in ids                 # 空分类剔除
+    assert ids.count("13") == 1             # 同 id 只出现一次
+    names = {c["id"]: c["name"] for c in cats}
+    assert names["13"] == "粤语"             # 取最后定义（语言组）
+    assert names["37"] == "华语"

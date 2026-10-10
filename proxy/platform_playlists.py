@@ -351,14 +351,39 @@ async def _wy_recommend(client: httpx.AsyncClient, sort: str, page: int, limit: 
     return out
 
 
+async def _kw_resolve_digest(client: httpx.AsyncClient, category: str) -> str:
+    """酷我分类 id → 该分类在 getTagList 里声明的 digest（跨组不同：专区=43、
+    其它=10000）。**同 id 冲突时取最后定义**（与取歌单接口的实际语义一致）。
+    查不到回落 10000（上游对多数分类宽松，能取到即用）。
+    """
+    cat = str(category or "").strip()
+    url = ("http://wapi.kuwo.cn/api/pc/classify/playlist/getTagList"
+           "?loginUid=0&loginSid=0")
+    data = await _get(client, url, _KW_HEADERS)
+    groups = (data or {}).get("data") if isinstance(data, dict) else None
+    found = ""
+    if isinstance(groups, list):
+        for g in groups:
+            if not isinstance(g, dict):
+                continue
+            for it in g.get("data") or []:
+                if isinstance(it, dict) and str(it.get("id")) == cat and it.get("digest"):
+                    found = str(it["digest"])  # 不 break：取最后一个
+    return found or "10000"
+
+
 async def _kw_recommend(client: httpx.AsyncClient, sort: str, page: int, limit: int,
                         category: str = "") -> list[dict]:
     order = "new" if sort == "new" else "hot"
     cat = str(category or "").strip()
     if cat.isdigit():
-        # 指定分类：getTagPlayList（实测 id 即分类 id，digest 传 10000 或 43 均可）
+        # 指定分类：getTagPlayList。digest 需与分类**同组**：分类表里「专区」组
+        # 的条目 digest=43、「主题/心情/…」组为 10000（实测同组内一致，跨组不同）。
+        # 传错 digest 多数仍能取到（上游宽松），但专区类的 digest 必须对上，
+        # 故这里从分类表反查该 id 的真实 digest，查不到再回落 10000。
+        digest = await _kw_resolve_digest(client, cat)
         url = ("http://wapi.kuwo.cn/api/pc/classify/playlist/getTagPlayList"
-               f"?loginUid=0&loginSid=0&pn={page}&rn={limit}&id={cat}&digest=10000")
+               f"?loginUid=0&loginSid=0&pn={page}&rn={limit}&id={cat}&digest={digest}")
     else:
         url = ("http://wapi.kuwo.cn/api/pc/classify/playlist/getRcmPlayList"
                f"?loginUid=0&loginSid=0&appUid=76039576&pn={page}&rn={limit}&order={order}")
@@ -381,7 +406,21 @@ async def _kw_recommend(client: httpx.AsyncClient, sort: str, page: int, limit: 
 
 
 async def _kg_resolve_tag(client: httpx.AsyncClient, category: str) -> str:
-    """酷狗分类 id → 取歌单接口要的 special_tag_id（tag/info 解析；失败原样返回）。"""
+    """酷狗分类 id → 取歌单接口要的 tagid。
+
+    实测（2026-10 复验）：`tag/specialList` 的 `tagid` 参数应为该分类的
+    `special_tag_id`。**但** kg 的分类树里有两类节点：
+      * 真·叶子分类（如 `34 80后` → `special_tag_id=14`、`96 00后` → `571`）
+        —— tag/info 能给出非 0 的 special_tag_id，取歌单正常；
+      * **纯分组节点**（`153 专区`/`1599 风格`/`2009 语言`/`2005 心情`/
+        `2007 主题`/`2003 场景`/`1263 特色`/`2011 乐器`）——它们的
+        `special_tag_id`/`song_tag_id`/`album_tag_id` **全为 0**，且
+        `tag/list?pid=<自身>` 也列不出子项（上游不下发），意味着这些分组
+        **本身没有任何歌单**。注意 `32 年龄` 也是 0，但 kg 恰好支持
+        `tagid=32` 直取，属特例。
+    返回：解析到的 `special_tag_id`；解析不到时**原样返回分类 id**
+    （`32 年龄` 这类特例需要 `tagid=32` 才能取到，故不能返回空）。
+    """
     cat = str(category or "").strip()
     if not cat.isdigit():
         return ""
@@ -396,23 +435,43 @@ async def _kg_resolve_tag(client: httpx.AsyncClient, category: str) -> str:
     return cat
 
 
+async def _kg_category_has_content(client: httpx.AsyncClient, category: str) -> bool:
+    """该 kg 分类是否真有歌单（用 tag/specialList 的 total 判定）。"""
+    cat = str(category or "").strip()
+    if not cat.isdigit():
+        return False
+    tagid = await _kg_resolve_tag(client, cat)
+    if not tagid:
+        return False
+    url = ("http://mobilecdnbj.kugou.com/api/v3/tag/specialList"
+           f"?plat=0&page=1&tagid={tagid}&pagesize=1&ugc=1&id={cat}&sort=2")
+    data = await _get(client, url, _KG_HEADERS)
+    if not isinstance(data, dict):
+        return False
+    try:
+        return int((data.get("data") or {}).get("total") or 0) > 0
+    except (TypeError, ValueError):
+        return False
+
+
 async def _kg_recommend(client: httpx.AsyncClient, sort: str, page: int, limit: int,
                         category: str = "") -> list[dict]:
     sort_map = {"hot": "6", "new": "7", "recommend": "5"}
     t = sort_map.get(sort, sort_map["recommend"])
     cat = str(category or "").strip()
     if cat.isdigit():
-        # 指定分类：tag/specialList（tagid 需先由 tag/info 解析）
-        tagid = await _kg_resolve_tag(client, cat) or cat
+        # 指定分类：tag/specialList（tagid = special_tag_id；纯分组为 0 → 取不到）
+        tagid = await _kg_resolve_tag(client, cat)
         url = ("http://mobilecdnbj.kugou.com/api/v3/tag/specialList"
                f"?plat=0&page={page}&tagid={tagid}&pagesize={limit}&ugc=1&id={cat}&sort=2")
         data = await _get(client, url, _KG_HEADERS)
         rows = (data or {}).get("data", {}).get("info") if isinstance(data, dict) else None
         if not isinstance(rows, list):
             rows = (data or {}).get("data", {}).get("list") if isinstance(data, dict) else None
-        if not isinstance(rows, list):
-            # 分类接口不可用时退回通用热门（保证不空）
-            return await _kg_recommend(client, sort, page, limit, "")
+        if not isinstance(rows, list) or not rows:
+            # 该分类（多半是纯分组节点）没有歌单：**不回落通用热门**，
+            # 否则「选了分类却出无关歌单」比空列表更误导。
+            return []
     else:
         url = ("http://www2.kugou.kugou.com/yueku/v9/special/getSpecial"
                f"?is_ajax=1&cdn=cdn&t={t}&c=&p={page}")
@@ -585,7 +644,16 @@ async def _tx_categories(client: httpx.AsyncClient) -> list[dict[str, str]]:
 
 
 async def _kg_categories(client: httpx.AsyncClient) -> list[dict[str, str]]:
-    """酷狗分类树（tag/list pid=0）。children 为空，只取顶层父分类。"""
+    """酷狗分类树（tag/list pid=0，带 apiver=2 才拿到 10 个分组）。
+
+    注意（2026-10 复验）：这 10 个分组里 **只有 `32 年龄` / `2777 长音频`
+    下发了 children**，其余 8 个（专区/心情/特色/场景/主题/语言/风格/乐器）
+    的 `tag/list?pid=<自身>` 一律返回空 —— 上游不下发子项，且这些分组自身
+    `special_tag_id=0`（无歌单）。
+
+    因此这里**用 `tag/specialList` 的 total 逐个探测**，只保留真有歌单的分类；
+    分组节点（total=0）直接剔除，避免用户选到一个永远出不了歌单的分类。
+    """
     url = "http://mobilecdnbj.kugou.com/api/v3/tag/list?pid=0&apiver=2&plat=0"
     data = await _get(client, url, _KG_HEADERS)
     rows = (data or {}).get("data", {}).get("info") if isinstance(data, dict) else None
@@ -599,12 +667,48 @@ async def _kg_categories(client: httpx.AsyncClient) -> list[dict[str, str]]:
         cname = clean_html(it.get("name"))
         if not cid or not cname:
             continue
-        out.append({"id": str(cid), "name": cname, "group": "分类"})
+        children = [c for c in (it.get("children") or []) if isinstance(c, dict)]
+        if children:
+            # 有下发的子项：一并列出（子项即真·叶子分类，带内容）
+            for ch in children:
+                schid = ch.get("id")
+                schname = clean_html(ch.get("name"))
+                if schid and schname:
+                    out.append({"id": str(schid), "name": schname, "group": cname})
+            continue
+        # 无子项：仅当该节点自身有歌单才收录
+        try:
+            if await _kg_category_has_content(client, str(cid)):
+                out.append({"id": str(cid), "name": cname, "group": "分类"})
+        except Exception:  # noqa: BLE001
+            continue
     return out
 
 
+async def _kw_category_has_content(client: httpx.AsyncClient, category: str, digest: str) -> bool:
+    """该 kw 分类是否真有歌单（用 getTagPlayList 的首条判定）。"""
+    cat = str(category or "").strip()
+    if not cat.isdigit():
+        return False
+    url = ("http://wapi.kuwo.cn/api/pc/classify/playlist/getTagPlayList"
+           f"?loginUid=0&loginSid=0&pn=1&rn=1&id={cat}&digest={digest or '10000'}")
+    data = await _get(client, url, _KW_HEADERS)
+    inner = (data or {}).get("data", {}).get("data") if isinstance(data, dict) else None
+    return isinstance(inner, list) and len(inner) > 0
+
+
 async def _kw_categories(client: httpx.AsyncClient) -> list[dict[str, str]]:
-    """酷我分类（getTagList：data[].data[]，每项含 id/name/digest）。"""
+    """酷我分类（getTagList：data[].data[]，每项含 id/name/digest）。
+
+    实测（2026-10 复验）：分类表本身会列出**大量无内容**的条目——尤其「专区」组
+    17 个里只有 5 个（K歌/国风/铃声/佛乐/轻音乐）真能取到歌单，其余 12 个
+    （经典老歌/网红/DJ/影视/动漫/新歌首发/小说/儿童/评书/综艺/古典/Vlog）
+    上游返回 0 条。另有 **id 冲突**：`13` 既是「轻音乐专区」又是「粤语」，
+    `12` 既是「国风专区」又是「小语种」（同 id 会被取歌单接口视为同一分类）。
+
+    因此逐个探测内容，**只保留真有歌单的条目，并按 id 去重**（后出现的组
+    复用同一 id 时直接跳过，避免列表出现两个同名内容不同的选项）。
+    """
     url = ("http://wapi.kuwo.cn/api/pc/classify/playlist/getTagList"
            "?loginUid=0&loginSid=0")
     data = await _get(client, url, _KW_HEADERS)
@@ -612,6 +716,11 @@ async def _kw_categories(client: httpx.AsyncClient) -> list[dict[str, str]]:
     if not isinstance(groups, list):
         return []
     out: list[dict[str, str]] = []
+    seen_ids: set[str] = set()
+    # 先按 id 收敛到「最后定义」（kw 对同 id 的分类实际解析到后面那组的语义：
+    # 实测 id=13 → 粤语（语言组）、id=12 → 小语种（语言组），而不是专区组同名项）。
+    # 用 dict 保序覆盖即可。
+    merged: dict[str, dict[str, str]] = {}
     for g in groups:
         if not isinstance(g, dict):
             continue
@@ -623,7 +732,19 @@ async def _kw_categories(client: httpx.AsyncClient) -> list[dict[str, str]]:
             cname = clean_html(it.get("name"))
             if not cid or not cname:
                 continue
-            out.append({"id": str(cid), "name": cname, "group": gname})
+            sid = str(cid)
+            merged[sid] = {"id": sid, "name": cname, "group": gname,
+                           "digest": str(it.get("digest") or "")}
+    for sid, item in merged.items():
+        if sid in seen_ids:
+            continue
+        try:
+            if not await _kw_category_has_content(client, sid, item.get("digest", "")):
+                continue
+        except Exception:  # noqa: BLE001
+            continue
+        seen_ids.add(sid)
+        out.append({"id": sid, "name": item["name"], "group": item["group"]})
     return out
 
 
