@@ -2943,6 +2943,8 @@ def ensure_registry_warm() -> None:
                       CONF.get("plt_dir") or os.path.join(_HOME, "playlist_tracks"),
                       dailyrec.play_history_dir(),
                       dailyrec.recommend_cache_dir(),
+                      # 广场歌单曲目（独立子目录，落盘结构同 recommend bundle）
+                      _discover_track_dir(),
                       nmpl.cache_dir()):
         for path in _iter_registry_jsons(directory):
             try:
@@ -7122,6 +7124,71 @@ _DISCOVER_COVER_FORWARD: dict[str, str] = {}
 _DISCOVER_COVER_MAX = 512
 
 
+# discover 曲目落盘目录：广场歌单曲目此前只存在**进程内** _DISCOVER_TRACK_CACHE，
+# 重启即空 → ensure_registry_warm() 无从重建 fake↔real 映射 → App 持旧 coverId
+# 来取封面时 resolve_real_guid 反解失败 → 列表里曲目封面全丢（详情页因会重新登记
+# 而正常）。落盘后 warm 能重建，与每日/热门推荐曲目同等待遇。
+_DISCOVER_TRACK_DIR_NAME = "discover_tracks"
+# 落盘上限：广场歌单卡最多约 60 张，留 4 倍余量后按最旧清理，避免目录无界增长
+_DISCOVER_TRACK_FILE_MAX = 256
+
+
+def _discover_track_dir() -> str:
+    return os.path.join(dailyrec.recommend_cache_dir(), _DISCOVER_TRACK_DIR_NAME)
+
+
+def _discover_track_path(source: str, playlist_id: str) -> str:
+    safe = re.sub(r"[^A-Za-z0-9\-_]", "_", f"{source}__{playlist_id}")
+    return os.path.join(_discover_track_dir(), f"{safe}.json")
+
+
+def _prune_discover_tracks() -> None:
+    """落盘文件超限时按 mtime 最旧清掉一半（与进程内缓存同款粗粒度策略）。"""
+    d = _discover_track_dir()
+    try:
+        files = [(os.path.getmtime(os.path.join(d, n)), os.path.join(d, n))
+                 for n in os.listdir(d) if n.endswith(".json")]
+    except OSError:
+        return
+    if len(files) <= _DISCOVER_TRACK_FILE_MAX:
+        return
+    files.sort()
+    for _ts, path in files[: len(files) - _DISCOVER_TRACK_FILE_MAX // 2]:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+def _save_discover_tracks(source: str, playlist_id: str, tracks: list[dict]) -> None:
+    """把某广场歌单曲目 VO 落盘（供重启后重建 fake 映射与封面反查）。"""
+    if not tracks:
+        return
+    path = _discover_track_path(source, playlist_id)
+    try:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
+            json.dump({"version": 1, "ts": time.time(),
+                       "source": source, "playlistId": playlist_id,
+                       "tracks": tracks}, fh, ensure_ascii=False)
+        os.replace(tmp, path)
+        _prune_discover_tracks()
+    except OSError as exc:
+        logger.warning("discover: 曲目落盘失败 %s: %s", path, exc)
+
+
+def _persisted_discover_tracks(source: str, playlist_id: str) -> list[dict]:
+    """落盘曲目兜底（上游不可用时用；同时供 warm 重建 fake 映射）。"""
+    try:
+        with open(_discover_track_path(source, playlist_id), "r", encoding="utf-8") as fh:
+            raw = json.load(fh)
+    except (OSError, ValueError):
+        return []
+    tracks = raw.get("tracks") if isinstance(raw, dict) else None
+    return [t for t in tracks if isinstance(t, dict)] if isinstance(tracks, list) else []
+
+
 def _resolve_discover_guid(raw_candidate: str, resolved_guid: str) -> str:
     """判定封面请求是否属于 discover 歌单，返回其歌单 guid；否返回 ""。
 
@@ -7429,10 +7496,17 @@ async def _load_discover_tracks(source: str, playlist_id: str) -> list[dict]:
     client = get_platform_client(app)
     items = await plpl.fetch_playlist_tracks(client, source, playlist_id, 100)
     tracks = [t for t in (build_online_track(it) for it in items) if t]
+    if not tracks:
+        # 上游不可用（弱网/限流/风控）时用落盘曲目兜底，别让歌单整块空白
+        tracks = _persisted_discover_tracks(source, playlist_id)
     if tracks:
         # 登记真实元数据：这些曲目不走搜索，_SEARCH_CACHE 里没有它们，
         # 播放时 metadata 接口只能拿到 lxserver 合成的"未知曲目/未知歌手"。
         onreg.REGISTRY.record_tracks(tracks)
+        # 落盘：广场曲目不在收藏/历史/推荐缓存任一目录，不落盘则重启后
+        # ensure_registry_warm() 重建不出 fake↔real 映射，App 持旧 coverId
+        # 取封面会全部失败（列表无图，详情因重新登记而正常）。
+        _save_discover_tracks(source, playlist_id, tracks)
         if len(_DISCOVER_TRACK_CACHE) > 200:
             # 简单裁剪：清空最早的一半（key 无序，按写入时间近似）
             for k in list(_DISCOVER_TRACK_CACHE)[: len(_DISCOVER_TRACK_CACHE) // 2]:

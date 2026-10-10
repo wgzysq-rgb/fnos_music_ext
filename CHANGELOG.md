@@ -5,6 +5,41 @@
 
 ## [Unreleased]
 
+## [2.7.12] - 2026-10-10
+
+### 修复
+
+- **广场歌单「列表」前十几首曲目没有封面（点进详情却有）**：2.7.11 修好卡片
+  封面后暴露出同源问题的第二半。App 进歌单先拉一次曲目列表拿到一批
+  `coverId`，这些 `coverId` 由 `disguise_client_json()` 伪装成
+  `track_<32hex>`；fake ↔ real 的映射**只存在进程内 `_FAKE_GUID_REVERSE`**，
+  **一重启即全部丢失**。而 `ensure_registry_warm()` 只扫
+  `fav_dir` / `plt_dir` / `play_history_dir` / `recommend_cache_dir` /
+  `nmpl.cache_dir()` 五个目录 —— 广场曲目此前**只写进程内
+  `_DISCOVER_TRACK_CACHE`、从不落盘**，warm 无从重建 → App 持重启前的
+  `coverId` 取封面时 `resolve_real_guid` 反解失败 → 落到非 online 兜底分支 →
+  返回 `{"code":0,"data":{"list":[],"total":0}}`（一段 JSON）→ 图片解码失败 →
+  无封面。**「前十几首」正是 App 首屏批量请求的那一批**；点进详情会重新走
+  列表接口、把 fake↔real 重新登记回内存表，所以**详情有、列表没有**。
+  - 新增广场曲目落盘：`_discover_track_dir()` / `_discover_track_path()` /
+    `_save_discover_tracks()` / `_persisted_discover_tracks()` /
+    `_prune_discover_tracks()`，落盘于
+    `<recommend_cache>/discover_tracks/<source>__<playlist_id>.json`
+    （与 `recommend_cache/<user>/*.json` 同款结构，`_iter_registry_jsons()`
+    天然可扫）。文件数超 256 时按 mtime 最旧清掉一半。
+  - `_load_discover_tracks()`：拉取上游成功即落盘；上游不可用时回落
+    `_persisted_discover_tracks()` 兜底（重启后离线仍能出列表与封面）。
+  - `ensure_registry_warm()` 目录元组新增 `_discover_track_dir()`，重启后
+    可重建广场曲目的 fake↔real 映射。
+
+### 测试
+
+- 新增 `test_discover_tracks_persisted_to_disk`：断言拉取曲目列表后落盘文件
+  存在且字段完整（source / playlistId / tracks / guid 前缀）。
+- 新增 `test_discover_track_cover_survives_restart`：严格模拟重启（清空
+  全部进程内表与 fake 映射、复位 warm 标记），验证每首曲目仍能 302 到
+  **各自的**封面直链。
+
 ## [2.7.11] - 2026-10-10
 
 ### 修复

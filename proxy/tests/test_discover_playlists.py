@@ -268,6 +268,66 @@ def test_playlist_track_list_returns_track_vos(monkeypatch):
         assert first["duration"] == 200000
 
 
+def test_discover_tracks_persisted_to_disk(monkeypatch):
+    """广场歌单曲目必须落盘（否则重启后 warm 重建不出 fake 映射）。"""
+    import json
+    import os
+    _patch_platform(monkeypatch, "wy", _stub_cards(), _stub_tracks())
+    app.state.upstream_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(_auth_user()), base_url="http://unix"
+    )
+    with TestClient(app) as client:
+        client.get("/music/api/v1/track/playlist-detail/list",
+                   params={"playlistGUID": "online:playlist:discover:wy:PLID1"})
+        path = appmod._discover_track_path("wy", "PLID1")
+        assert os.path.exists(path), "曲目未落盘"
+        raw = json.load(open(path, encoding="utf-8"))
+        assert raw["source"] == "wy" and raw["playlistId"] == "PLID1"
+        assert len(raw["tracks"]) == 2
+        assert str(raw["tracks"][0]["guid"]).startswith("online:lx:wy:")
+
+
+def test_discover_track_cover_survives_restart(monkeypatch):
+    """重启后列表曲目封面必须仍能出图。
+
+    历史 bug：广场曲目只存进程内 _DISCOVER_TRACK_CACHE，不落盘 →
+    ensure_registry_warm() 无从重建 fake↔real 映射 → App 持旧 coverId 取封面
+    时 resolve_real_guid 反解失败 → 走到非 online 分支返回列表 JSON → 无图。
+    表现为「歌单里前十几首没封面，点进详情又有」（详情会重新登记）。
+    """
+    _patch_platform(monkeypatch, "wy", _stub_cards(), _stub_tracks())
+    app.state.upstream_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(_auth_user()), base_url="http://unix"
+    )
+    with TestClient(app) as client:
+        data = client.get("/music/api/v1/track/playlist-detail/list",
+                          params={"playlistGUID": "online:playlist:discover:wy:PLID1"}).json()["data"]
+        cover_ids = [t["coverId"] for t in data["list"]]
+        assert cover_ids and all(c.startswith("track_") for c in cover_ids)
+
+        # === 严格模拟重启：所有进程内表清空 + warm 标记复位 ===
+        _DISCOVER_COVER_REVERSE.clear()
+        _DISCOVER_COVER_FORWARD.clear()
+        _DISCOVER_CARD_INDEX.clear()
+        _DISCOVER_TRACK_CACHE.clear()
+        _DISCOVER_CACHE.clear()
+        appmod._FAKE_GUID_REVERSE.clear()
+        appmod._FAKE_ALBUM_REGISTRY.clear()
+        monkeypatch.setattr(appmod, "_DISCOVER_CARD_INDEX_LOADED", False)
+        monkeypatch.setattr(appmod, "_REGISTRY_WARMED", False)
+
+        # 每首曲目各自对应自己的封面直链（桩数据：曲目一 → http://c/1.jpg，曲目二 → http://c/2.jpg）
+        expected = ["http://c/1.jpg", "http://c/2.jpg"]
+        assert len(cover_ids) == len(expected)
+        for cid, want in zip(cover_ids, expected):
+            r = client.get("/music/api/v1/static/cover", params={"coverId": cid},
+                           follow_redirects=False)
+            ctype = r.headers.get("content-type") or ""
+            assert r.status_code == 302, f"重启后未出图: {r.status_code} {r.content[:100]}"
+            assert ctype != "application/json", "重启后返回了 JSON（反解失败）"
+            assert r.headers["location"] == want
+
+
 def test_static_cover_redirects_to_platform_cover(monkeypatch):
     _patch_platform(monkeypatch, "wy", _stub_cards(), _stub_tracks())
     app.state.upstream_client = httpx.AsyncClient(
