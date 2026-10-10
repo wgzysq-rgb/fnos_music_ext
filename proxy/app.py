@@ -119,6 +119,9 @@ CONF = {
     "cover_proxy": os.environ.get("FNMUSIC_COVER_PROXY", "true").lower() in ("true", "1", "yes"),
     "cover_cache_dir": os.environ.get("FNMUSIC_COVER_CACHE_DIR", ""),
     "cover_cache_max": int(os.environ.get("FNMUSIC_COVER_CACHE_MAX", "2000")),
+    # 封面探针：记录每条 /static/cover 请求命中的分支与最终产物（含歌单封面
+    # 为何退到占位图/404），用于真机定位"某个列表没封面"。默认开
+    "cover_probe": os.environ.get("FNMUSIC_COVER_PROBE", "true").lower() in ("true", "1", "yes"),
     "music_db": os.environ.get(
         "FNMUSIC_MUSIC_DB", "/usr/local/apps/@appdata/trim.music/db/music.db"
     ),
@@ -524,6 +527,7 @@ _ENV_WATCH_KEYS: dict[str, tuple[str, str]] = {
     "FNMUSIC_COVER_PROXY": ("cover_proxy", "bool"),
     "FNMUSIC_COVER_CACHE_DIR": ("cover_cache_dir", "str"),
     "FNMUSIC_COVER_CACHE_MAX": ("cover_cache_max", "cover_cache_max"),
+    "FNMUSIC_COVER_PROBE": ("cover_probe", "bool"),
     "FNMUSIC_COVER_ENRICH": ("cover_enrich", "bool"),
     "FNMUSIC_TRACE_FORWARD": ("trace_forward", "bool"),
     "FNMUSIC_TRANSCODE_ENABLED": ("transcode_enabled", "bool"),
@@ -1399,6 +1403,32 @@ def _cover_cache_store(url: str, data: bytes, mime: str) -> str:
     return path
 
 
+# 拉取失败的封面 URL 短时记忆：源站 CDN 不可达/防盗链时，不必让每个封面请求
+# 都白等满超时（一页 30 张封面会被拖成几十秒），失败过的 URL 在 TTL 内直接
+# 回落 302 由客户端自己取。
+_COVER_PROXY_FAIL_TTL_S = 600.0
+_COVER_PROXY_FAIL_MAX = 2000
+_COVER_PROXY_FAILED: dict[str, float] = {}
+
+
+def _cover_proxy_recently_failed(url: str) -> bool:
+    ts = _COVER_PROXY_FAILED.get(url)
+    if ts is None:
+        return False
+    if time.monotonic() - ts > _COVER_PROXY_FAIL_TTL_S:
+        _COVER_PROXY_FAILED.pop(url, None)
+        return False
+    return True
+
+
+def _cover_proxy_mark_failed(url: str) -> None:
+    if len(_COVER_PROXY_FAILED) >= _COVER_PROXY_FAIL_MAX:
+        # 简单裁剪：丢掉最旧的一半，避免无界增长
+        for k in list(_COVER_PROXY_FAILED)[: _COVER_PROXY_FAIL_MAX // 2]:
+            _COVER_PROXY_FAILED.pop(k, None)
+    _COVER_PROXY_FAILED[url] = time.monotonic()
+
+
 async def _cover_proxy_response(url: str) -> "Response | None":
     """封面代理：命中/代取成功返回本地文件响应，否则 None（调用方回落 302）。"""
     url = str(url or "").strip()
@@ -1409,8 +1439,11 @@ async def _cover_proxy_response(url: str) -> "Response | None":
     hit = _cover_cache_lookup(url)
     if hit:
         return FileResponse(hit, headers={"Cache-Control": "public, max-age=86400"})
+    if _cover_proxy_recently_failed(url):
+        return None
     fetched = await asyncio.to_thread(download_cover_bytes, url)
     if fetched is None:
+        _cover_proxy_mark_failed(url)
         return None
     data, mime = fetched
     path = _cover_cache_store(url, data, mime)
@@ -6269,9 +6302,42 @@ def _official_cover_file_response(cover_id: str, size: str | None = None) -> Res
     return None
 
 
+def _cover_probe_note(resp: Response) -> str:
+    """封面探针的产物标注：一眼看出这次的封面最终是什么形态。"""
+    cls = type(resp).__name__
+    if cls == "RedirectResponse":
+        return f" redirect->{(resp.headers.get('location') or '')[:90]}"
+    if cls == "FileResponse":
+        return " local-file(代理缓存/官方封面文件)"
+    if cls == "StreamingResponse":
+        return " upstream-stream(官方封面透传)"
+    ctype = str(resp.headers.get("content-type") or "")
+    if ctype.startswith("image/"):
+        return " inline-image(占位图/内嵌图/官方法封面直出)"
+    return ""
+
+
 @app.api_route("/music/api/v1/static/cover", methods=["GET", "HEAD"])
 @app.api_route("/music/api/v1/static/cover/{subpath:path}", methods=["GET", "HEAD"])
 async def static_cover(request: Request, subpath: str = ""):
+    resp = await _static_cover_impl(request, subpath)
+    if CONF.get("cover_probe"):
+        try:
+            cid = request.query_params.get("coverId") or subpath or "-"
+            logger.info(
+                "cover probe: %s coverId=%s size=%s -> %s%s",
+                request.method,
+                str(cid)[:120],
+                request.query_params.get("size") or "-",
+                resp.status_code,
+                _cover_probe_note(resp),
+            )
+        except Exception:  # noqa: BLE001
+            pass
+    return resp
+
+
+async def _static_cover_impl(request: Request, subpath: str = ""):
     guid = extract_guid(request, subpath if is_online_guid(subpath) else None)
     if not guid and subpath.startswith("online:"):
         guid = subpath
@@ -6308,7 +6374,21 @@ async def static_cover(request: Request, subpath: str = ""):
             return auth_resp
         cached = dailyrec.load_daily_cache(user_guid, dailyrec.today_key(), playlist_kind)
         tracks = (cached or {}).get("tracks") or []
+        # 歌单封面出口（2026-10-10 修复）：快照里"有现成 cover_url / 本地 coverId"
+        # 的曲目优先；整单都没有时（在线音源构建的推荐歌单常态：搜索结果不带
+        # cover_url，coverId 又是 online: 形态）改取第一首在线曲目，交给下面的
+        # 在线封面链（_online_info → 登记表 → CDN 直构 → 网易补全 → 内嵌 → 占位图）
+        # 处理。歌单是列表里的门面，绝不允许 404 留空。
         picked = dailyrec.pick_playlist_cover_track(tracks)
+        if picked is None:
+            picked = next(
+                (
+                    t
+                    for t in tracks
+                    if isinstance(t, dict) and is_online_guid(str(t.get("guid") or ""))
+                ),
+                None,
+            )
         picked_guid = str((picked or {}).get("guid") or "")
         if not is_online_guid(picked_guid):
             cover_id = str((picked or {}).get("coverId") or "")
@@ -6325,22 +6405,35 @@ async def static_cover(request: Request, subpath: str = ""):
                     headers=headers,
                 )
                 cover_resp = await upstream_client.send(cover_req, stream=True)
-                cover_headers = filter_headers(
-                    cover_resp.headers, exclude_keys={"content-length", "content-encoding"}
-                )
+                if cover_resp.status_code < 400:
+                    cover_headers = filter_headers(
+                        cover_resp.headers, exclude_keys={"content-length", "content-encoding"}
+                    )
 
-                async def _cover_stream():
-                    try:
-                        async for chunk in cover_resp.aiter_bytes():
-                            yield chunk
-                    finally:
-                        await cover_resp.aclose()
+                    async def _cover_stream():
+                        try:
+                            async for chunk in cover_resp.aiter_bytes():
+                                yield chunk
+                        finally:
+                            await cover_resp.aclose()
 
-                return StreamingResponse(
-                    _cover_stream(), status_code=cover_resp.status_code, headers=cover_headers
-                )
-            # 歌单里没有可用封面：不显示图标，客户端回落自带默认样式
-            return Response(status_code=404)
+                    return StreamingResponse(
+                        _cover_stream(), status_code=cover_resp.status_code, headers=cover_headers
+                    )
+                await cover_resp.aclose()
+            # 官方侧没有这张封面：快照自带的直链兜底（下载/边听边存的本地曲目可能
+            # 登记过源站封面），再不行才回落占位图——歌单封面不留空
+            snap_cover = _cover_url_of(picked)
+            if snap_cover.startswith(("http://", "https://")) and _KW_TEXT_COVER_HOST not in snap_cover:
+                proxied = await _cover_proxy_response(snap_cover)
+                if proxied is not None:
+                    return proxied
+                return RedirectResponse(snap_cover, status_code=302)
+            logger.info(
+                "playlist cover %s kind=%s picked=%s -> placeholder(no usable cover)",
+                guid, playlist_kind, picked_guid or "-",
+            )
+            return _placeholder_cover_response(guid)
         guid = picked_guid
     # 网易账号歌单封面：登记的封面直链直接 302（兼容重启后反查表未重建的裸假 id）
     nm_pl_id = nmpl.playlist_id_from_cover_request(guid, request.query_params.get("coverId") or subpath)
@@ -6351,7 +6444,9 @@ async def static_cover(request: Request, subpath: str = ""):
             if proxied is not None:
                 return proxied
             return RedirectResponse(cover, status_code=302)
-        return Response(status_code=404)
+        # 未登记封面直链（重启后反查表未重建等）：占位图兜底，不留空
+        logger.info("netease playlist cover %s -> placeholder(no registered cover)", guid)
+        return _placeholder_cover_response(guid)
     if not is_online_guid(guid):
         local_resp = _official_cover_file_response(guid, size=request.query_params.get("size"))
         if local_resp is not None:
@@ -6369,7 +6464,7 @@ async def static_cover(request: Request, subpath: str = ""):
             return RedirectResponse(cover, status_code=302)
         return _placeholder_cover_response(guid)
 
-    data = await _online_info(request, guid)
+    data = _registry_apply(guid, await _online_info(request, guid))
     cover = str((data or {}).get("cover_url") or "")
     # ① 已知直链封面：代理缓存优先，失败 302 直链兜底；酷我文本封面（artistpicserver 返回的是文本页）除外
     if cover and _KW_TEXT_COVER_HOST not in cover:

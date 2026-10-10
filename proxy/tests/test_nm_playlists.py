@@ -222,10 +222,11 @@ def test_cover_redirect():
         resp = client.get("/music/api/v1/static/cover", params={"coverId": f"track_{fake}"}, follow_redirects=False)
         assert resp.status_code == 302
         assert resp.headers["location"] == "http://img/111.jpg"
-        # 无封面直链的私歌单：404（客户端回落默认样式）
+        # 无封面直链的私歌单：2.7.8 起回落占位图，不再 404（歌单封面不留空）
         fake333 = fake_official_guid("online:playlist:nm:333")
         resp = client.get("/music/api/v1/static/cover", params={"coverId": f"track_{fake333}"}, follow_redirects=False)
-        assert resp.status_code == 404
+        assert resp.status_code == 200
+        assert resp.headers.get("content-type") == "image/png"
 
 
 def test_readonly_guards_absorb_writes():

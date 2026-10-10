@@ -205,7 +205,9 @@ def test_render_env_includes_lx_comment():
     import tempfile
     from pathlib import Path
 
-    with tempfile.NamedTemporaryFile("w", suffix=".env", delete=False) as f:
+    # 显式 UTF-8：Windows 非 UTF-8 模式（cp936）下默认编码写出的中文注释
+    # 会被 parse_env_file 的 utf-8 读取打脸（UnicodeDecodeError）
+    with tempfile.NamedTemporaryFile("w", suffix=".env", delete=False, encoding="utf-8") as f:
         f.write(text)
         path = f.name
     kv2, _ = env_merge.parse_env_file(Path(path))

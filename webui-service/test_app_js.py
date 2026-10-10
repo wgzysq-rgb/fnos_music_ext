@@ -26,6 +26,10 @@ def test_app_js_suite():
         [NODE, str(TEST_JS)],
         capture_output=True,
         text=True,
+        # 显式 UTF-8：node 一律输出 UTF-8，而 Windows 非 UTF-8 模式（cp936）
+        # 下 text=True 会用 locale 编码解码，中文用例名会直接抛 UnicodeDecodeError
+        encoding="utf-8",
+        errors="replace",
         timeout=120,
         cwd=str(HERE),
     )

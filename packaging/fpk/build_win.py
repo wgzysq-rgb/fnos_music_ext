@@ -118,7 +118,19 @@ def _normalize_eol(data: bytes) -> bytes:
 
 
 def log(msg: str) -> None:
-    print(f"[fpk] {msg}", flush=True)
+    """打印进度。
+
+    日志里有中文与 ✓ 等符号，而 Windows 控制台默认是 cp936 —— 直接 print 会
+    抛 UnicodeEncodeError 让打包**在最后一步失败**（实测：行尾门禁通过后崩）。
+    这里显式降级：先尝试原样输出，失败则按当前编码替换不可编码字符。
+    """
+    text = f"[fpk] {msg}"
+    try:
+        print(text, flush=True)
+    except UnicodeEncodeError:
+        enc = getattr(sys.stdout, "encoding", None) or "utf-8"
+        sys.stdout.buffer.write(text.encode(enc, "replace") + b"\n")
+        sys.stdout.buffer.flush()
 
 
 def _is_excluded(rel: Path) -> bool:

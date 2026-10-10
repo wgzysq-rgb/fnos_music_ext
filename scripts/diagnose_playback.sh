@@ -166,6 +166,38 @@ say "  Background full fetch saved/failed ...           → 切歌后的后台�
 say "  曲库探测失败：music.db 不存在 / shared_library 无可用路径"
 say "     → 落盘退化到 cache 目录（文件名哈希、不进官方曲库），需要修 FNMUSIC_MUSIC_DB/库目录"
 say "  Library scan triggered/failed ...                → 落盘后通知官方重扫（默认禁用，无此行属正常）"
+say ""
+say "封面（cover probe）关注这几行："
+say "  cover probe: GET coverId=<歌单guid> ... -> 200 local-file  → 命中 NAS 缓存，正常"
+say "  cover probe: ... -> 302 redirect-><CDN>                    → 代理没取到，回落直链"
+say "  cover probe: ... -> 200 inline-image(占位图...)            → 走的占位图兜底"
+say "  playlist cover <guid> kind=daily ... -> placeholder(no usable cover)"
+say "     → 该歌单快照整单都没有可用封面（在线音源构建的歌单常见）"
+say "  netease playlist cover ... -> placeholder(no registered cover)"
+say "     → 网易歌单封面直链未登记（重启后反查表未重建）"
+
+# --------------------------------------------------- 5b. 封面缓存与歌单封面 --
+sec "5b. 封面探针摘要与缓存规模"
+say "-- cover probe 产物分布（最近 3000 行日志）--"
+d logs --tail 3000 "$CONTAINER" 2>&1 | grep -E "cover probe:" | tail -40 | tee -a "$OUT" || true
+say ""
+say "-- 歌单封面兜底记录 --"
+d logs --tail 3000 "$CONTAINER" 2>&1 | grep -E "playlist cover .*(placeholder|local-file)" | tail -20 | tee -a "$OUT" || true
+say ""
+d exec "$CONTAINER" sh -c '
+  root="${FNMUSIC_COVER_CACHE_DIR:-${FNMUSIC_CACHE_DIR:-/data/cache}/covers}"
+  if [ -d "$root" ]; then
+    echo "封面缓存目录: $root"
+    echo "文件数: $(ls "$root" 2>/dev/null | wc -l)   占用: $(du -sh "$root" 2>/dev/null | cut -f1)"
+    ls -lt "$root" 2>/dev/null | head -6
+  else
+    echo "(尚无封面缓存目录 $root)"
+  fi
+' 2>&1 | tee -a "$OUT" || true
+say ""
+say "解读：若歌单封面全是 placeholder，说明该歌单快照没有可用的封面来源"
+say "      （在线音源搜索结果通常不带 cover_url）；升级到 2.7.8+ 后应能自动"
+say "      用首曲的在线封面/登记表封面，仍不行则把本节内容贴回对话。"
 
 # --------------------------------------------------- 6. 转码 HLS 一致性 --
 sec "6. 转码 HLS 会话一致性（声明分片数 vs 磁盘实际分片数）"

@@ -32,10 +32,14 @@ def anyio_backend():
 
 @pytest.fixture
 def cover_cache_env(monkeypatch, tmp_path):
-    """隔离的封面缓存目录 + 代理开关打开。"""
+    """隔离的封面缓存目录 + 代理开关打开（并清空跨用例共享的失败短时记忆）。"""
     monkeypatch.setitem(proxy_app.CONF, "cover_proxy", True)
     monkeypatch.setitem(proxy_app.CONF, "cover_cache_dir", str(tmp_path / "covers"))
-    return tmp_path / "covers"
+    proxy_app._COVER_PROXY_FAILED.clear()
+    try:
+        yield tmp_path / "covers"
+    finally:
+        proxy_app._COVER_PROXY_FAILED.clear()
 
 
 # ----------------------------------------------------------------- 单元层 --

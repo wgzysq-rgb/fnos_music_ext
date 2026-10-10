@@ -645,8 +645,13 @@ def test_static_cover_playlist_skips_coverless_tracks(tmp_path, monkeypatch):
     assert resp.headers.get("location") == "http://img.music.migu.cn/2.jpg"
 
 
-def test_static_cover_playlist_without_covers_returns_404(tmp_path, monkeypatch):
-    """歌单内全部曲目无封面 → 404（客户端回落自带默认样式，不再给占位图）。"""
+def test_static_cover_playlist_without_covers_falls_back_placeholder(tmp_path, monkeypatch):
+    """歌单内全部曲目无封面：2.7.8 起回落到占位图/首曲在线封面，不再 404。
+
+    旧行为（2.7.7 及以前）是 404 让客户端显示自带默认样式，真机表现是歌单
+    完全没有封面图 —— 在线音源构建的推荐歌单整单都没有 cover_url，命中概率
+    极高。现在改为：快照封面 → 首曲在线封面链 → 占位图，绝不留空。
+    """
     rec_dir = _cover_env(tmp_path, monkeypatch)
     tracks = [
         {"guid": "online:migu:1", "coverId": "online:migu:1", "cover_url": ""},
@@ -656,7 +661,8 @@ def test_static_cover_playlist_without_covers_returns_404(tmp_path, monkeypatch)
 
     with TestClient(app) as client:
         resp = client.get(f"/music/api/v1/static/cover?coverId={pl_guid}&size=120", follow_redirects=False)
-    assert resp.status_code == 404
+    assert resp.status_code == 200
+    assert resp.headers.get("content-type") == "image/png"
 
 
 def test_static_cover_disguised_playlist_cover_survives_restart(tmp_path, monkeypatch):

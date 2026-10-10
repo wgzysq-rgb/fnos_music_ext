@@ -5,6 +5,56 @@
 
 ## [Unreleased]
 
+## [2.7.8] - 2026-10-10
+
+### 修复
+
+- **歌单（每日推荐 / 热门推荐 / 网易账号歌单）完全没有封面图**：`/static/cover`
+  的歌单分支在"快照里找不到可用封面"时**直接 404**，客户端只显示裂图/空图标。
+  而**在线音源构建的推荐歌单整单都不带 `cover_url`、`coverId` 又是 `online:`
+  形态**，`pick_playlist_cover_track()` 必然返回 None —— 于是整张歌单封面从未
+  显示过。这与文件里早就写明的原则（"在线曲目封面永不 404，空封面是客户端
+  裂图的主要来源"）自相矛盾，歌单封面此前没有被这条原则覆盖。修复：
+  - 歌单封面出口补全为一条完整兜底链：**快照自带 `cover_url`（代理/302）→
+    首曲在线曲目走在线封面链（上游封面 → 在线登记表 → kw rid/qq albummid
+    直构 → 网易补全 → 本地内嵌图）→ 本地官方 `coverId` 透传（上游返回
+    ≥400 时不再原样透传坏状态）→ 占位图池**。任何一步成功即返回，**绝不再 404**；
+  - `pick_playlist_cover_track()` 返回 None（整单无现成封面）时，改用**第一首
+    在线曲目**作为封面来源，交给在线封面链处理；
+  - 网易账号歌单封面直链未登记（重启后反查表未重建）时同样回落占位图，不再 404；
+  - 在线曲目封面链读取上游详情后**再过一遍在线登记表**（`_registry_apply`）：
+    登记表里有封面直链而上游没有时，此前会白白走到占位图。
+
+### 变更
+
+- **修复 Windows 打包脚本在中文控制台下崩溃**：`packaging/fpk/build_win.py`
+  在最后一步打印「行尾门禁 … ✓」时，cp936 控制台无法编码 `✓` →
+  `UnicodeEncodeError` 直接中断（前后多次打包都卡在这一步，包其实已经生成、
+  但退出码为 1 且 sha256 行不打印）。`log()` 改为编码不可用时降级替换输出。
+- **封面代理新增失败短时记忆**：某个封面 URL 取回失败后 10 分钟内不再重试
+  （直接回落 302 由客户端自取），避免一个不可达/防盗链的 CDN 让整页封面
+  每张都白等满 8 秒超时。
+- **新增封面探针 `FNMUSIC_COVER_PROBE`（默认开）**：记录每条 `/static/cover`
+  请求最终落到的形态（NAS 本地文件 / 302 直链 / 官方透传 / 占位图），歌单封面
+  退占位图时另打一行说明原因，便于真机定位"某个列表没封面"。
+- `scripts/diagnose_playback.sh` 新增 **5b 封面探针摘要段**：按产物类型列出最近
+  的封面请求结果、歌单封面兜底记录、封面缓存目录规模与占用。
+
+### 测试
+
+- 新增 `proxy/tests/test_playlist_cover.py`（8 个用例）：整单在线曲目无封面
+  不再 404、登记表封面可被歌单封面采用、本地 coverId 上游 404 回落占位图、
+  上游 200 原样透传、快照 cover_url 走代理/302、网易歌单无封面回落占位图、
+  负缓存不重复取回、封面探针日志。
+- 更新两处**断言旧 404 行为**的用例（歌单无封面 → 占位图，属有意的行为变更）：
+  `test_nm_playlists.py::test_cover_redirect`、
+  `test_v2_features.py::test_static_cover_playlist_without_covers_falls_back_placeholder`。
+- 加固两个编码敏感用例（Windows 非 UTF-8 模式下会因 cp936 抽风失败，CI 不受影响）：
+  `webui-service/test_app_js.py` 显式 `encoding="utf-8", errors="replace"`；
+  `test_version_env.py` 临时 .env 显式 UTF-8 写入。
+- 全量：`proxy/tests` + `webui-service` 在 UTF-8 模式下 **534 passed / 55 skipped /
+  0 failed**；PowerShell（cp936、node 可用）下 webui 61 passed / 2 skipped。
+
 ## [2.7.7] - 2026-10-10
 
 ### 新增
