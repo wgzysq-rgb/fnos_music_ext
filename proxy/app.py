@@ -3528,6 +3528,17 @@ async def search_track(request: Request):
     # 本页在线切片 = 全局分页区间与在线区间的交集；纯本地页（区间未触及在线段）
     # 在线切片为空，上游结果原样透传，只有 total 计入在线条数驱动客户端继续翻页。
     selected = _online_window(entry, page, size, original_total)
+    # 搜索来的在线曲目也要登记进持久化 REGISTRY（v2.8.6）：
+    # 此前它们只存在内存 _SEARCH_CACHE 里，代理重启后即丢；重播（最近播放）
+    # 时 lxserver 缓存若已逐出，metadata 只能拿到占位值「未知曲目/未知歌手」
+    # ——音频（按 rid 解析直链）与歌词（独立端点）都正常，唯独标题显示异常。
+    if selected:
+        onreg.REGISTRY.record_many(
+            m for m in (
+                onreg.meta_from_track_vo({**item, "guid": online_guid_from_item(item)})
+                for item in selected
+            ) if m
+        )
     merged = merge_online_tracks(upstream_json, selected, page=1, size=size, selected=True)
     merged["data"]["total"] = original_total + total_online
     # 预取下一页的在线段：源未取尽且池未填满时后台先取一轮，连续翻页零等待

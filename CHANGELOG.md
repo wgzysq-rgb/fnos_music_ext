@@ -5,6 +5,26 @@
 
 ## [Unreleased]
 
+## [2.8.6] - 2026-10-11
+
+### 修复
+
+- **最近播放里重播「之前是在线搜出来的歌」时，播放界面显示「未知曲目/未知歌手」
+  （但音频能播、歌词也正常）**（用户报 bug A）。
+  - 根因：之前`在线曲目元数据登记表（REGISTRY）`只覆盖**推荐歌单
+    （daily/hot/discover）/ 网易账号歌单**下发下来的曲目；**搜索结果里的在线曲目
+    只活在内存 `_SEARCH_CACHE`**，从不登记进持久化 REGISTRY。代理重启、或
+    lxserver 缓存把这条 id 逐出后，再播放（典型场景：最近播放）时 `track/metadata`
+    只能从 lxserver 拿到合成的占位值「未知曲目/未知歌手」——音频是按 rid 直解析链、
+    歌词是独立端点，所以两者都正常，唯独标题/歌手显示异常。
+  - 修复：`search_track` 在计算出本页在线切片 `_online_window()` 后，把切片里的
+    在线条目**一并 `record_many` 进持久化 REGISTRY**（`meta_from_track_vo` 提取，
+    自动跳过本地/纯占位条目）。回填逻辑不变：只替换 title/artist/album/cover_url
+    占位值，时长 `duration_s` 仍不回填（避免破坏转码 HLS 分片不变量）。
+  - 新增回归测试：`test_search_results_register_metadata`、
+    `test_search_track_replay_backfills_metadata`（清空 `_SEARCH_CACHE` 后
+    仍能用登记值回填，隔离验证 REGISTRY 的贡献）。
+
 ## [2.8.5] - 2026-10-11
 
 ### 修复

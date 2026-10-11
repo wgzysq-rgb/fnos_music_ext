@@ -327,3 +327,98 @@ def test_metadata_without_registration_still_returns_upstream(monkeypatch):
         resp = client.get("/music/api/v1/track/metadata", params={"guid": "online:lx:wy:999"})
     assert resp.status_code == 200
     assert resp.json()["data"]["title"] == "未知曲目"
+
+
+# ---------------------------- 端到端：搜索结果重播（bug 1, v2.8.6） ------------
+
+def _lx_search_returning(items: list):
+    """构造只认 /api/v1/search 的洛雪客户端 handler：返回改名后的在线曲目。"""
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path != "/api/v1/search":
+            return httpx.Response(404, json={"ok": False})
+        return httpx.Response(200, json={"ok": True, "items": items, "errors": {}})
+    return handler
+
+
+def _search_upstream_handler(request: httpx.Request) -> httpx.Response:
+    # 本地搜索空，全部走在线；同时兼容官方搜索响应形态
+    return httpx.Response(200, json={"code": 0, "data": {"list": [], "total": 0}})
+
+
+def test_search_results_register_metadata(monkeypatch):
+    """回归 bug 1（v2.8.6）：搜索结果里的在线曲目现在也要登记进持久化 REGISTRY。
+
+    此前它们只存在内存 _SEARCH_CACHE，代理重启 / lxserver 缓存逐出后再播放
+    （最近播放）时 metadata 只剩占位值"未知曲目"，而音频与歌词仍正常。
+    """
+    lx_items = [
+        {"id": "lx:kw:447197599", "lx_source": "kw", "title": "短视频曲目一",
+         "artist": "歌手A", "album": "专辑A", "duration_s": 180.0, "ext": "mp3",
+         "cover_url": "http://c/k.jpg", "file_size": 1000},
+        {"id": "lx:wy:111", "lx_source": "wy", "title": "在线曲目二",
+         "artist": "歌手B", "album": "专辑B", "duration_s": 200.0, "ext": "flac",
+         "cover_url": "http://c/w.jpg", "file_size": 1200},
+    ]
+    app.state.upstream_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(_search_upstream_handler), base_url="http://unix")
+    app.state.lx_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(_lx_search_returning(lx_items)),
+        base_url="http://127.0.0.1:8772")
+
+    with TestClient(app) as client:
+        resp = client.get("/music/api/v1/search/track?q=test&page=1&size=50")
+        assert resp.status_code == 200
+
+    meta1 = onreg.REGISTRY.lookup("online:lx:kw:447197599")
+    assert meta1 is not None, "搜索结果里的在线曲目应登记进 REGISTRY"
+    assert meta1["title"] == "短视频曲目一"
+    assert meta1["artist"] == "歌手A"
+    meta2 = onreg.REGISTRY.lookup("online:lx:wy:111")
+    assert meta2 is not None and meta2["title"] == "在线曲目二"
+
+
+def test_search_track_replay_backfills_metadata(monkeypatch):
+    """端到端回归 bug 1：搜索在线曲目 → 登记 → 模拟"最近播放"重播时 _SEARCH_CACHE
+    已失效（重启 / 逐出）、lxserver 缓存也未命中只回占位值，metadata 接口必须用
+    登记值回填真实标题 / 歌手（否则用户看到的正是"未知曲目"）。
+
+    测试刻意清空 _SEARCH_CACHE，使 _retained_track 落空，从而**只**检验登记表
+    的回填贡献（而非 _SEARCH_CACHE 命中）。
+    """
+    lx_items = [
+        {"id": "lx:kw:447197599", "lx_source": "kw", "title": "短视频曲目一",
+         "artist": "歌手A", "album": "专辑A", "duration_s": 180.0, "ext": "mp3",
+         "cover_url": "http://c/k.jpg", "file_size": 1000},
+    ]
+    app.state.upstream_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(_search_upstream_handler), base_url="http://unix")
+    app.state.lx_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(_lx_search_returning(lx_items)),
+        base_url="http://127.0.0.1:8772")
+
+    with TestClient(app) as client:
+        assert client.get(
+            "/music/api/v1/search/track?q=test&page=1&size=50").status_code == 200
+
+    # 模拟重启 / 缓存逐出：搜索内存表清空，只有 REGISTRY（持久化）还在
+    _SEARCH_CACHE.clear()
+
+    # 重播：lxserver 缓存已逐出，只回占位值
+    lx_seen: list = []
+    app.state.upstream_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(_auth_user()), base_url="http://unix")
+    app.state.lx_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(_lx_client_returning_placeholder(lx_seen)),
+        base_url="http://127.0.0.1:8772")
+
+    with TestClient(app) as client:
+        resp = client.get("/music/api/v1/track/metadata",
+                          params={"guid": "online:lx:kw:447197599"})
+
+    assert resp.status_code == 200
+    data = resp.json()["data"]
+    assert data["title"] == "短视频曲目一", f'期望真实标题，实际 {data["title"]!r}'
+    assert data["artists"][0]["name"] == "歌手A"
+    assert data["album"]["name"] == "专辑A"
+    # 确实走了上游（证明是"回填"而不是"没查上游"）
+    assert any("track/info" in u for u in lx_seen)
