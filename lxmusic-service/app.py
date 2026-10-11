@@ -827,6 +827,48 @@ async def recommend_charts(limit: int = Query(0), sources: str = Query("")):
     return {"ok": True, "items": items[:limit], "errors": errors, "charts": ["kg", "kw", "wy"]}
 
 
+# 排行榜（榜单）通道：把 lxserver 的 boards/list 暴露给代理层（设置页多选 + 榜单曲目）。
+# 榜单仅 kg/kw/wy（lxserver 覆盖面）；tx 走 QQ 官方接口，不在本通道。
+
+@app.get("/api/v1/charts/boards")
+async def charts_boards(source: str = Query("")):
+    """某平台可用榜单列表（每项 {id, name, raw_id}，id 即 lxserver 的 bangid）。"""
+    src = normalize_source(source)
+    if src not in ("kg", "kw", "wy"):
+        return {"ok": True, "source": src, "boards": [], "charts": ["kg", "kw", "wy"]}
+    try:
+        boards = await LXSERVER.get_leaderboard_boards(src)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("charts boards %s failed: %s", src, e)
+        boards = []
+    out: list[dict] = []
+    for b in boards or []:
+        if not isinstance(b, dict):
+            continue
+        bid = str(b.get("bangid") or "").strip()
+        name = str(b.get("name") or "").strip()
+        if bid and name:
+            out.append({"id": bid, "name": name, "raw_id": str(b.get("id") or "")})
+    return {"ok": True, "source": src, "boards": out, "charts": ["kg", "kw", "wy"]}
+
+
+@app.get("/api/v1/charts/list")
+async def charts_list(source: str = Query(""), bangid: str = Query(""), limit: int = Query(200)):
+    """某榜单的曲目（key=bangid）：返回与 /api/v1/recommend 同形状的 items。"""
+    src = normalize_source(source)
+    bid = str(bangid or "").strip()
+    if src not in ("kg", "kw", "wy") or not bid:
+        return {"ok": True, "items": []}
+    try:
+        items = await LXSERVER.get_leaderboard_list(src, bid, page=1)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("charts list %s bangid=%s failed: %s", src, bid, e)
+        items = []
+    for it in items:
+        _cache_put(it)
+    return {"ok": True, "items": items[: max(1, min(int(limit or 200), 300))]}
+
+
 @app.get("/api/v1/track/url")
 async def track_url(
     id: str = Query("", alias="id"),

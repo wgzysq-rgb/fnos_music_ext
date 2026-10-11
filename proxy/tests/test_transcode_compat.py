@@ -993,6 +993,71 @@ def test_playlist_after_restart_counts_disk_segments(env):
     assert "#EXT-X-ENDLIST" in body
 
 
+# === lx 取流/转码共用请求头（2026-10-11） ===
+
+def test_lx_stream_headers_platform_referer_map():
+    """按平台补浏览器 UA + 防盗链 Referer；resolved 已带的不覆盖，且大小写归一不产生重复头。"""
+    h = appmod._lx_stream_headers("online:lx:kg:abc")
+    assert h["User-Agent"].startswith("Mozilla/5.0")
+    assert h["Referer"] == "https://www.kugou.com/"
+    assert appmod._lx_stream_headers("online:lx:kw:1")["Referer"] == "https://www.kuwo.cn/"
+    # tx/wy 无防盗链需求：只补浏览器 UA，不塞 Referer
+    tx = appmod._lx_stream_headers("online:lx:tx:xyz")
+    assert tx["User-Agent"].startswith("Mozilla/5.0") and "Referer" not in tx
+    # resolved 自带 referer（小写）时不覆盖，也不额外产生一个 "Referer" 键
+    h = appmod._lx_stream_headers("online:lx:kg:abc", {"headers": {"referer": "https://custom/"}})
+    assert h["Referer"] == "https://custom/"
+    assert sum(1 for k in h if k.lower() == "referer") == 1
+
+
+@pytest.mark.anyio
+async def test_transcode_source_lx_includes_platform_headers(env, monkeypatch):
+    """标准音质转码输入（喂给 ffmpeg）的 lx 直链必须带浏览器 UA + 平台 Referer。
+
+    回归：此前 `_transcode_source` 只搬 `resolved` 里的 referer/UA（kw/kg 为空），
+    ffmpeg 拉直链被 CDN 反爬拒掉 → 转码失败 → App 跳曲。流式下发修了、转码路径漏了。
+    """
+    async def fake_resolve(client, song_id, avoid_lossless=False):
+        return {"url": "https://cd.example/x.mp3", "ext": "mp3", "headers": {}}
+
+    monkeypatch.setattr(appmod, "resolve_lx_url", fake_resolve)
+    monkeypatch.setattr(appmod, "find_cache_file", lambda g: None)
+    monkeypatch.setattr(appmod, "_source_enabled", lambda g: True)
+
+    req = appmod._synth_request({})
+    src, headers = await appmod._transcode_source(req, "online:lx:kw:123")
+    assert src == "https://cd.example/x.mp3"
+    assert headers and headers["User-Agent"].startswith("Mozilla/5.0")
+    assert headers["Referer"] == "https://www.kuwo.cn/"
+
+    _src_kg, headers_kg = await appmod._transcode_source(req, "online:lx:kg:abc")
+    assert headers_kg["Referer"] == "https://www.kugou.com/"
+
+    _src_tx, headers_tx = await appmod._transcode_source(req, "online:lx:tx:xyz")
+    assert headers_tx["User-Agent"].startswith("Mozilla/5.0")
+    assert "Referer" not in headers_tx
+
+
+@pytest.mark.anyio
+async def test_resolve_lx_url_avoid_lossless_skips_lossless_tier(monkeypatch):
+    """无损档被判定损坏后重取（avoid_lossless）必须跳过 lossless，改用有损档兜底。
+
+    回归：某些平台（实测 tx/部分 kg）无损直链能解析、能下满但内容损坏 → 解码校验
+    被拒 → 永远存不下来。此时必须换 standard/high 有损档重取。
+    """
+    seen: list = []
+
+    class FakeClient:
+        async def get(self, path, params=None, timeout=None):
+            q = params["quality"]
+            seen.append(q)
+            return httpx.Response(200, json={"ok": True, "data": {"url": f"http://cdn/{q}", "ext": "mp3"}})
+
+    res = await appmod.resolve_lx_url(FakeClient(), "lx:tx:abc", avoid_lossless=True)
+    assert res and res["url"] == "http://cdn/standard"
+    assert "lossless" not in seen and seen[0] == "standard"
+
+
 # === 下载/落库元数据：在线登记表回填（"下载到本地仍是未知歌手 - 未知曲目"） ===
 # 根因：落盘点只判"非空"，把 lxserver 合成的占位常量当有效元数据写进曲库文件名
 # 与文件标签；而登记表只在播放详情（_online_info）接入了，落盘链路全都没查。

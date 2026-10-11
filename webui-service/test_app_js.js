@@ -281,6 +281,27 @@ test("平台推荐歌单开关：loadConfig 回填 + collectConfig 收集", asyn
   assert.strictEqual(els.get("#recommend-playlist-size").value, "12");
 });
 
+test("平台排行榜开关：loadConfig 回填 + collectConfig 收集", async () => {
+  reset();
+  enqueue("/app/fnmusic-ext/api/config", { values: {
+    FNMUSIC_RECOMMEND_CHARTS: "true",
+    FNMUSIC_RECOMMEND_CHARTS_LIST: "tx:26,wy:3778678",
+  } });
+  await global.loadConfig();
+  assert.strictEqual(els.get("#recommend-charts").checked, true);
+  const collected = global.collectConfig();
+  assert.strictEqual(collected.FNMUSIC_RECOMMEND_CHARTS, true);
+  assert.strictEqual(collected.FNMUSIC_RECOMMEND_CHARTS_LIST, "tx:26,wy:3778678");
+  // 缺省（默认关 / 空清单）表现
+  reset();
+  enqueue("/app/fnmusic-ext/api/config", { values: {} });
+  await global.loadConfig();
+  assert.strictEqual(els.get("#recommend-charts").checked, false);
+  const fallback = global.collectConfig();
+  assert.strictEqual(fallback.FNMUSIC_RECOMMEND_CHARTS, false);
+  assert.strictEqual(fallback.FNMUSIC_RECOMMEND_CHARTS_LIST, "");
+});
+
 /* ------------------------------------------------ 运行 --------------------- */
 (async () => {
   let failed = 0;

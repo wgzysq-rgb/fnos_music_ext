@@ -904,6 +904,68 @@ def test_playlist_categories_upstream_error_does_not_500(env_file, svctl, monkey
         assert r.json()["categories"] == []
 
 
+# --------------------------------------------------------- 排行榜端点（2.8.12） ---
+
+def test_playlist_charts_single_source(env_file, svctl, monkeypatch):
+    """单平台榜单：复用 proxy.platform_charts，返回 [{id,name,group}]。"""
+    from proxy import platform_charts as pchart
+
+    async def fake_charts(client, source, lx_base=""):
+        assert source == "tx"
+        return [{"id": "26", "name": "热歌榜", "group": "巅峰榜"},
+                {"id": "4", "name": "流行指数榜", "group": "巅峰榜"}]
+
+    monkeypatch.setattr(pchart, "fetch_platform_charts", fake_charts)
+    webui._CHART_CACHE.clear()
+    with authed_client() as client:
+        r = client.get("/api/playlist-charts?source=tx")
+        assert r.status_code == 200
+        body = r.json()
+        assert body["ok"] is True
+        assert [c["id"] for c in body["charts"]] == ["26", "4"]
+
+
+def test_playlist_charts_all_sources(env_file, svctl, monkeypatch):
+    """source 为空：返回全部支持榜单的平台（tx/wy）。"""
+    from proxy import platform_charts as pchart
+
+    async def fake_charts(client, source, lx_base=""):
+        return [{"id": f"{source}-1", "name": f"{source}榜", "group": "测试"}]
+
+    monkeypatch.setattr(pchart, "fetch_platform_charts", fake_charts)
+    webui._CHART_CACHE.clear()
+    with authed_client() as client:
+        r = client.get("/api/playlist-charts")
+        assert r.status_code == 200
+        body = r.json()
+        assert set(body["charts"].keys()) == {"tx", "wy", "kg", "kw"}
+        assert body["platforms"]["wy"] == "网易云"
+
+
+def test_playlist_charts_unsupported_platform(env_file, svctl):
+    """不支持榜单的平台（咪咕/酷我/酷狗）返回空列表，绝不 5xx。"""
+    webui._CHART_CACHE.clear()
+    with authed_client() as client:
+        r = client.get("/api/playlist-charts?source=mg")
+        assert r.status_code == 200
+        assert r.json()["charts"] == []
+
+
+def test_playlist_charts_upstream_error_does_not_500(env_file, svctl, monkeypatch):
+    """平台层抛异常时端点必须兜住，返回空/兜底表而不是 500。"""
+    from proxy import platform_charts as pchart
+
+    async def boom(client, source):
+        raise RuntimeError("upstream down")
+
+    monkeypatch.setattr(pchart, "fetch_platform_charts", boom)
+    webui._CHART_CACHE.clear()
+    with authed_client() as client:
+        r = client.get("/api/playlist-charts?source=tx")
+        assert r.status_code == 200
+        assert r.json()["charts"] == []
+
+
 # --------------------------------------------------------- 歌单分类端点（2.8.0） ---
 
 def test_playlist_categories_single_source(env_file, svctl, monkeypatch):

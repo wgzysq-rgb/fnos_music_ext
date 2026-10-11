@@ -313,6 +313,42 @@ def test_favorite_list_view_retries_pending_bind(env, monkeypatch):
     assert appmod.load_online_favorites("user-a") == []
 
 
+def test_bind_falls_back_to_registry_when_snapshot_empty(env, monkeypatch, tmp_path):
+    """绑定期元数据回退：收藏快照存空时，从在线登记表(REGISTRY)补齐并完成绑定。
+
+    回归：此前 `_bind_official_task` 缺 title/artist 时只查收藏快照自身，
+    快照存空即被永久跳过绑定 → 曲目停留在 `online/...` 在线引用态，
+    即使音频字节已落盘、已扫入官方曲库也不会转成本地条目。
+    """
+    make_official_db(env["db_path"], with_track=True)
+    monkeypatch.setattr(appmod, "find_cache_file", lambda guid: env["dirs"]["library"] + "/f.mp3")
+
+    # 元数据只放进 REGISTRY（模拟推荐/广场歌单下发时登记，而收藏快照却存空）
+    appmod.onreg.REGISTRY.reset_for_tests(str(tmp_path / "rec" / "online-track-index.json"))
+    appmod.onreg.REGISTRY.record(
+        {"guid": FAKE_KUWO1, "title": "晴天", "artist": "周杰伦", "album": "叶惠美"}
+    )
+    try:
+        empty_snapshot = {
+            "guid": FAKE_KUWO1, "title": "", "artist": "",
+            "album": {"guid": f"{FAKE_KUWO1}:album", "name": "", "coverId": FAKE_KUWO1},
+        }
+        appmod.save_online_favorites("user-a", [{
+            "guid": FAKE_KUWO1, "createdAt": 1, "bind": "pending", "track": empty_snapshot,
+        }])
+
+        with TestClient(app) as client:
+            resp = client.get("/music/api/v1/favorite-track/list", cookies={"music-token": "t"})
+            assert resp.status_code == 200
+            assert wait_for(lambda: upstream_posts(env["upstream_calls"], "/favorite-track/create"))
+
+        posts = upstream_posts(env["upstream_calls"], "/favorite-track/create")
+        assert posts and posts[0]["json"] == {"trackGUID": OFFICIAL_GUID}
+        assert appmod.load_online_favorites("user-a") == []
+    finally:
+        appmod.onreg.REGISTRY.reset_for_tests(str(tmp_path / "empty-index.json"))
+
+
 @pytest.mark.anyio
 async def test_resume_part_download_appends_and_finalizes(tmp_path, monkeypatch):
     """续传：Range 从断点续拉追加进 part，完成后转正并调度官方绑定。"""

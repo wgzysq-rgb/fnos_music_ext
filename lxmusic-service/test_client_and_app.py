@@ -193,6 +193,40 @@ def test_recommend_endpoint(test_app_client, fake_lx):
     )
 
 
+def test_charts_boards_endpoint(test_app_client, fake_lx):
+    """榜单列表端点：透传 lxserver boards，id 用 bangid（裸数字，list 端点只认它）。"""
+    res = test_app_client.get("/api/v1/charts/boards?source=kg")
+    assert res.status_code == 200
+    data = res.json()
+    assert data["ok"] is True
+    assert data["boards"] and data["boards"][0]["id"] == "8888"
+    assert data["boards"][0]["name"] == "TOP500"
+
+
+def test_charts_boards_unsupported_source(test_app_client):
+    res = test_app_client.get("/api/v1/charts/boards?source=tx")
+    assert res.status_code == 200
+    assert res.json()["boards"] == []
+
+
+def test_charts_list_endpoint(test_app_client, fake_lx):
+    """榜单曲目端点：按 bangid 取曲目，非空即证明走通了 lxserver list。"""
+    res = test_app_client.get("/api/v1/charts/list?source=kw&bangid=93&limit=5")
+    assert res.status_code == 200
+    data = res.json()
+    assert data["ok"] is True
+    assert len(data["items"]) > 0
+    assert fake_lx.leaderboard_list_calls
+    src, bangid, _page = fake_lx.leaderboard_list_calls[0]
+    assert src == "kw" and bangid == "93"
+
+
+def test_charts_list_missing_bangid_returns_empty(test_app_client):
+    res = test_app_client.get("/api/v1/charts/list?source=kg")
+    assert res.status_code == 200
+    assert res.json()["items"] == []
+
+
 def test_track_info_endpoint(test_app_client):
     # 未缓存条目返回合成数据
     res = test_app_client.get("/api/v1/track/info?id=lx:kw:5886682")

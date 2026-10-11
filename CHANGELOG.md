@@ -5,6 +5,139 @@
 
 ## [Unreleased]
 
+## [2.8.14] - 2026-10-11
+
+### 修复
+
+- **关掉「平台推荐歌单」总开关后，歌单列表里仍有平台推荐歌单（2.8.12 引入的回归）**。
+  - 根因：`_load_discover_playlists` 只看了「平台白名单 `_discover_sources()`」是否非空，
+    **没看总开关 `_discover_enabled()`**。2.8.12 起 `discover_on` 改成「平台歌单 **或** 排行榜
+    任一开启」，于是用户只开了排行榜时，平台白名单/分类即便残留也会被连带注入。
+  - 修复：平台卡必须同时满足「总开关开 + 白名单非空」；榜单卡同样必须满足「排行榜总开关开
+    + 勾选清单非空」。两个总开关各自独立生效，互不牵连。
+  - 回归测试：`test_discover_playlists.py::test_playlist_cards_gated_by_master_switch_even_with_charts_on`、
+    `::test_chart_cards_gated_by_charts_master_switch`。
+
+## [2.8.13] - 2026-10-11
+
+### 修复
+
+- **设置页保存排行榜配置报「不支持的配置键: FNMUSIC_RECOMMEND_CHARTS」**。
+  - 根因：2.8.12 新增的榜单配置键**没有登记进 WebUI 的 `SCHEMA` 白名单**（`/api/config`
+    只接受白名单内的键），保存直接被拒。
+  - 修复：`SCHEMA` 补 `FNMUSIC_RECOMMEND_CHARTS` / `FNMUSIC_RECOMMEND_CHARTS_LIST`，
+    并补进 `.env.example`（有回归测试 `test_recommend_playlist_keys_documented_in_env_example` 兜）。
+
+### 变更
+
+- **排行榜改为「总开关 + 勾选清单」**（与平台推荐歌单同款交互）：
+  - 新总开关 `FNMUSIC_RECOMMEND_CHARTS`（bool，默认关，对应设置页「平台排行榜」）；
+    勾选清单改到 `FNMUSIC_RECOMMEND_CHARTS_LIST`（csv `<平台>:<榜单id>`，空 = 不注入）。
+  - 设置页「推荐」下新增独立开关，关闭时隐藏「选择榜单」细节区。
+- **排行榜新增酷狗（kg）/ 酷我（kw）**：这两家的榜单曲目走 **lxserver 统一榜单通道**
+  （`lxmusic-service` 新增 `/api/v1/charts/boards` + `/api/v1/charts/list` 两个端点透传
+  lxserver 的 `leaderboard/boards|list`），因其平台自有 Web 接口已不可靠。QQ（tx）走
+  `musicu.fcg`、网易（wy）走 `/api/toplist`（均平台直连）。咪咕无榜单体系。
+  - 回归测试：`test_discover_playlists.py::test_lx_charts_kg_via_wrapper`、
+    `test_client_and_app.py::test_charts_boards_endpoint`/`test_charts_list_endpoint`。
+
+## [2.8.12] - 2026-10-11
+
+### 新增
+
+- **推荐歌单新增「排行榜」注入（QQ音乐 / 网易云，勾选式）**。
+  - 设置页「推荐」下新增「排行榜（榜单）」区：按平台列出该平台**全部榜单**，勾选即注入、
+    取消即移除（写入新配置 `FNMUSIC_RECOMMEND_CHARTS`，形如 `tx:26,tx:4,wy:19723756`）。
+  - 选中的榜单在「推荐歌单（发现）」里各显示为一张卡片，点进去播放该榜曲目；与「平台推荐歌单」
+    **互为独立开关**（只勾榜单、不勾平台歌单也照常注入），空 = 不注入任何榜单。
+  - 数据源：QQ `musicu.fcg`（`ToplistInfoServer/GetAll` 列表 + `GetDetail` 曲目，实测 29 个榜：
+    巅峰/地区/特色/全球榜）；网易 `/api/toplist`（63 个榜）+ 复用现有网易歌单取曲目。
+    榜单列表拉不到时回落内置兜底表，设置页不空。
+  - 新增 `proxy/platform_charts.py`；`webui-service` 新增 `/api/playlist-charts` 端点；
+    `platform_charts.py` 已同步加入 `container/Dockerfile` 的 `/srv/proxy/` COPY 清单与
+    `.dockerignore` 白名单（否则容器内 `from proxy import platform_charts` 会 ImportError）。
+  - 回归测试：proxy `test_discover_playlists.py::test_discover_chart_entries_parse` /
+    `::test_load_discover_charts_builds_cards` / `::test_load_discover_tracks_routes_chart_prefix`
+    等；webui `test_webui.py::test_playlist_charts_*`。
+
+## [2.8.11] - 2026-10-11
+
+### 修复
+
+- **「边听边存/收藏自动绑定」对部分在线曲目永远存不下（`.part` 一闪即逝）——真因是无损档内容损坏 + lx 无 mp3 兜底**。
+  - 现象（用户实测 + 日志实锤）：推荐歌单里播放时保存目录出现 `.part` 很快消失、歌曲没落盘。
+    日志：`tee finalize rejected corrupt lossless for online:lx:tx:<hash>` /
+    `audio decode check failed for ... (ext=flac bytes=...)` / `Background full fetch failed ... RuntimeError`。
+  - 根因：**某些平台（实测 tx/QQ，及部分 kg）的无损直链能解析、能下满，但内容损坏**——
+    在 NAS 上用 curl 下满该文件后 `ffmpeg -v error` 报 `invalid sync code / invalid frame header /
+    decode_frame() failed`（`ffprobe` 头正常、`ffmpeg` 退出码 0 但解码报错）。代理的落盘前
+    解码校验（`_audio_file_ok`：要求"退出码 0 且无任何 stderr"）因此**拒绝该文件并删除**
+    → `.part` 消失、歌曲存不下。而同曲目的**标准音质（mp3）档是完好的**（`ID3…`、解码零报错），
+    wy（网易）的无损档也是完好的。
+  - 修复：**无损档被判损坏后，lx 通道必须真正降档到有损档重取**（此前 `force_mp3` 只对 musicdl
+    分支生效、lx 分支被忽略 → 重试仍取无损 → 再次失败 → 永远存不下）：
+    - `resolve_lx_url(..., avoid_lossless=True)`：跳过 `lossless`，改取 `standard → high`。
+    - `_open_online_stream` / `_transcode_source` 的 lx 分支在「强制 mp3 或该曲无损已拉黑」时传
+      `avoid_lossless=True`。
+    - 顺带给 `_audio_file_ok` 补上失败原因日志（`rc=`+ffmpeg stderr 首行），下次不必再猜。
+  - 回归测试：`test_transcode_compat.py::test_resolve_lx_url_avoid_lossless_skips_lossless_tier`。
+
+## [2.8.10] - 2026-10-11
+
+### 修复
+
+- **标准音质播放（走转码/ffmpeg）的 lx 直链取流漏带浏览器 UA + 平台防盗链 Referer（bug B 同源遗漏）**。
+  - 现象：在推荐歌单里**标准音质**播放时，保存目录出现一个 `.part` 临时文件很快消失，歌曲没落盘。
+  - 根因：标准音质播放走 `/track/transcode`，代理用 **ffmpeg** 拉 lx 直链
+    （`_transcode_source` → `transcode.py::_ffmpeg_argv` 的 `-headers`/`-user_agent`）。
+    但 `_transcode_source` 只搬 `resolved["headers"]` 里的 referer/UA（**kw/kg 为空**），
+    没补浏览器 UA 与平台 Referer → **kw/kg 的 CDN 反爬拒掉 ffmpeg 取流 → 转码失败**。
+    即 2.8.7/2.8.8 的修复只覆盖了**流式下发** `_open_online_stream`，**漏了转码输入**这条路。
+  - 修复：抽出共用函数 `_lx_stream_headers(guid, resolved)`（浏览器 UA + 按平台 Referer 表
+    `_LX_REFERER`：`kw`→kuwo、`kg`→kugou；resolved 已带的不覆盖、Key 大小写归一），
+    **流式下发与转码输入两条路都用它**，杜绝再次分叉。
+  - 回归测试：`test_transcode_compat.py::test_lx_stream_headers_platform_referer_map`、
+    `::test_transcode_source_lx_includes_platform_headers`。
+
+## [2.8.9] - 2026-10-11
+
+### 修复
+
+- **收藏/最近播放的在线曲目「列表显示未知歌曲 + 永不绑定本地」的元数据缺口（加固）**。
+  - 背景：即便音频字节已落盘（如 2.8.8 修好 kg 下载后），若**记录期**没抓到标题/歌手，
+    收藏快照会存成空 → 列表显示「未知歌曲」、封面缺失，且**官方绑定被永久跳过**
+    （曲目停留在 `online/lx/...` 在线引用态，看起来像"没落盘"）。
+  - 根因：元数据回退链在**记录期**与**绑定期**不完整：
+    - 收藏记录期 `_best_effort_online_info` 只查「搜索会话缓存 + 在线登记表 + 实时取流 +
+      落地文件名」，**不查推荐/网易/广场歌单的磁盘缓存**（这类曲目从未走搜索，元数据只在缓存里）；
+      而最近播放记录路径本就会查该缓存 → 所以"历史通常正常、收藏易缺"。
+    - 绑定期 `_bind_official_task` 缺 title/artist 时**只回退查收藏快照自身**，不查登记表/歌单缓存
+      → 快照一旦存空就不再尝试绑定。
+  - 修复：
+    - `_best_effort_online_info` 在现有兜底后，追加 `_lookup_playlist_cache_track` 回退
+      （与最近播放记录路径同源）。
+    - `_bind_official_task` 缺元数据时改为走完整回退链：在线登记表(REGISTRY) → 推荐/网易/广场
+      歌单磁盘缓存 → 收藏/历史快照，命中才跳过绑定。
+  - 回归测试：`test_official_bind.py::test_bind_falls_back_to_registry_when_snapshot_empty`
+    （收藏快照存空、元数据只在 REGISTRY 时仍能完成绑定）。
+
+## [2.8.8] - 2026-10-11
+
+### 修复
+
+- **酷狗（kg/kugou）在线曲目后台整轨下载失败、收藏/最近播放始终落不了盘（与 bug B 同类）**。
+  - 现象：`journalctl -u fnmusic-ext` 里大量 `Background full fetch failed for online:lx:kg:...: RuntimeError`，
+    tx/wy/kw 都正常落盘（`tee finalize done`），唯独 kg 反复失败；磁盘里也没有 `未知歌手 - 未知曲目*.mp3`
+    之类的脏名文件——说明是**下载本身抛错**，不是元数据/绑定缺口。
+  - 根因：2.8.7 的 bug B 修复只给 `lx:kw`（kuwo）补了 `Referer: https://www.kuwo.cn/`，**漏掉了
+    `lx:kg`（kugou）。kugou CDN 同样防盗链，缺 Referer 时拒绝代理的 httpx 取流** →
+    `_open_online_stream` 返回 None → 后台整轨下载抛 `open failed` RuntimeError → 永不落盘、
+    永不绑定（收藏/最近播放里一直是 `online/lx/...` 在线引用态）。
+  - 修复：把「平台 → 防盗链 Referer」抽成 `_LX_REFERER` 表（`kw`→kuwo、`kg`→kugou），lx 分支按
+    平台补齐，与 kw 处理同款、结构性可扩展；tx/wy 不受影响。
+  - 顺带把后台下载失败日志从裸 `RuntimeError` 改成带底层原因（`open failed` / `size mismatch` /
+    `corrupt stream even at mp3 tier`），下次排查不必再靠猜。
+
 ## [2.8.7] - 2026-10-11
 
 ### 修复

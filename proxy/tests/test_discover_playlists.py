@@ -7,6 +7,7 @@
   - 静态封面端点对 discover 歌单 302 到平台封面直链
   - 开关关闭时零注入（不影响官方透传）
 """
+import asyncio
 import os
 import time
 
@@ -857,3 +858,132 @@ def test_kw_categories_filters_empty_and_dedupes(monkeypatch):
     names = {c["id"]: c["name"] for c in cats}
     assert names["13"] == "粤语"             # 取最后定义（语言组）
     assert names["37"] == "华语"
+
+
+# ------------------------------------------------------------ 排行榜（榜单） --
+
+def test_discover_chart_entries_parse(monkeypatch):
+    """FNMUSIC_RECOMMEND_CHARTS → [(source, chart_id)]；不支持平台/非法项忽略；空=无。"""
+    monkeypatch.setitem(CONF, "recommend_charts_list",
+                        "tx:26,tx:4,wy:19723756,kg:8888,kw:93,mg:1,bad,zz:9")
+    assert appmod._discover_chart_entries() == [
+        ("tx", "26"), ("tx", "4"), ("wy", "19723756"), ("kg", "8888"), ("kw", "93")]
+    monkeypatch.setitem(CONF, "recommend_charts_list", "")
+    assert appmod._discover_chart_entries() == []
+
+
+def test_load_discover_charts_builds_cards(monkeypatch):
+    """勾选榜单 → 虚拟歌单卡：guid=discover:<src>:chart_<id>，名字/封面来自榜单列表。"""
+    monkeypatch.setitem(CONF, "recommend_charts", True)
+    monkeypatch.setitem(CONF, "recommend_charts_list", "tx:26")
+
+    async def fake_charts(client, source, lx_base=""):
+        return [{"id": "26", "name": "热歌榜", "group": "巅峰榜", "cover": "http://c/1.jpg"}]
+
+    monkeypatch.setattr(appmod.pchart, "fetch_platform_charts", fake_charts)
+    appmod._CHART_LIST_CACHE.clear()
+    cards = asyncio.run(appmod._load_discover_charts())
+    assert len(cards) == 1
+    c = cards[0]
+    assert c["guid"] == dailyrec.discover_playlist_guid("tx", "chart_26")
+    assert dailyrec.parse_discover_playlist_guid(c["guid"]) == ("tx", "chart_26")
+    assert c["name"] == "热歌榜"
+    assert c["playlistId"] == "chart_26"
+    assert c["source"] == "tx"
+    assert c["coverUrl"] == "http://c/1.jpg"
+
+
+def test_load_discover_charts_fallback_name_when_list_unavailable(monkeypatch):
+    """榜单列表拉不到时仍生成卡片，名字用「平台标签+榜单id」兜底（不至于没得选）。"""
+    monkeypatch.setitem(CONF, "recommend_charts", True)
+    monkeypatch.setitem(CONF, "recommend_charts_list", "wy:3778678")
+
+    async def fake_charts(client, source, lx_base=""):
+        return []
+
+    monkeypatch.setattr(appmod.pchart, "fetch_platform_charts", fake_charts)
+    appmod._CHART_LIST_CACHE.clear()
+    cards = asyncio.run(appmod._load_discover_charts())
+    assert len(cards) == 1 and cards[0]["playlistId"] == "chart_3778678"
+    assert cards[0]["name"]
+
+
+def test_load_discover_tracks_routes_chart_prefix(monkeypatch):
+    """playlistId 以 chart_ 开头 → 走榜单取曲目（fetch_chart_tracks），不误走歌单接口。"""
+    calls = []
+
+    async def fake_tracks(client, source, chart_id, limit=100, lx_base=""):
+        calls.append((source, str(chart_id)))
+        return []
+
+    monkeypatch.setattr(appmod.pchart, "fetch_chart_tracks", fake_tracks)
+    appmod._DISCOVER_TRACK_CACHE.clear()
+    asyncio.run(appmod._load_discover_tracks("tx", "chart_26"))
+    assert calls == [("tx", "26")]
+
+
+def test_lx_charts_kg_via_wrapper():
+    """kg/kw 榜单走 lxmusic-service：boards 端点取榜单、list 端点取曲目（归一为 lx 条目）。"""
+    from proxy import platform_charts as pchart
+
+    class FakeResp:
+        def __init__(self, payload):
+            self._p = payload
+            self.status_code = 200
+
+        def json(self):
+            return self._p
+
+    class FakeLx:
+        async def get(self, path, params=None, timeout=None):
+            if path == "/api/v1/charts/boards":
+                assert params["source"] == "kg"
+                return FakeResp({"ok": True, "boards": [
+                    {"id": "8888", "name": "TOP500", "raw_id": "kg__8888"},
+                    {"id": "24971", "name": "DJ热歌榜", "raw_id": "kg__24971"}]})
+            if path == "/api/v1/charts/list":
+                assert params == {"source": "kg", "bangid": "8888", "limit": 100}
+                return FakeResp({"ok": True, "items": [
+                    {"id": "lx:kg:abc", "lx_source": "kg", "title": "T", "artist": "A",
+                     "album": "AL", "duration_s": 200, "ext": "mp3", "cover_url": "http://c"}]})
+            raise AssertionError(path)
+
+    charts = asyncio.run(pchart.fetch_platform_charts(FakeLx(), "kg"))
+    assert [c["id"] for c in charts] == ["8888", "24971"]
+    assert charts[0]["name"] == "TOP500"
+    tracks = asyncio.run(pchart.fetch_chart_tracks(FakeLx(), "kg", "8888", 100))
+    assert tracks and tracks[0]["id"] == "lx:kg:abc" and tracks[0]["source"] == "lx"
+    assert tracks[0]["title"] == "T"
+
+
+def test_chart_platforms_include_kg_kw():
+    from proxy import platform_charts as pchart
+    assert set(pchart.CHART_PLATFORMS) >= {"tx", "wy", "kg", "kw"}
+
+
+def test_playlist_cards_gated_by_master_switch_even_with_charts_on(monkeypatch):
+    """平台歌单总开关关闭时，即便白名单/分类还在、排行榜又开着，也不得注入平台卡。
+
+    回归（2.8.12）：`_load_discover_playlists` 之前只看 `_discover_sources()`、不看总开关；
+    排行榜一开 `discover_on` 就为真 → 平台卡被连带注入（用户关总开关却仍有推荐歌单）。
+    """
+    monkeypatch.setitem(CONF, "recommend_playlist", False)        # 平台歌单总开关关
+    monkeypatch.setitem(CONF, "recommend_playlist_source", "tx")  # 白名单仍留着
+    monkeypatch.setitem(CONF, "recommend_charts", True)
+    monkeypatch.setitem(CONF, "recommend_charts_list", "wy:3778678")
+
+    async def fake_charts(client, source, lx_base=""):
+        return [{"id": "3778678", "name": "热歌榜", "group": "官方榜", "cover": ""}]
+
+    monkeypatch.setattr(appmod.pchart, "fetch_platform_charts", fake_charts)
+    appmod._CHART_LIST_CACHE.clear()
+    cards = asyncio.run(appmod._load_discover_playlists())
+    assert {c["source"] for c in cards} == {"wy"}                 # 只有榜单卡
+    assert all(c["playlistId"].startswith("chart_") for c in cards)
+
+
+def test_chart_cards_gated_by_charts_master_switch(monkeypatch):
+    """排行榜总开关关闭时，即便勾选清单还在，也不得注入榜单卡。"""
+    monkeypatch.setitem(CONF, "recommend_charts", False)
+    monkeypatch.setitem(CONF, "recommend_charts_list", "wy:3778678")
+    assert asyncio.run(appmod._load_discover_charts()) == []

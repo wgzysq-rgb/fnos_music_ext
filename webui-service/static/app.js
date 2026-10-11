@@ -13,12 +13,15 @@ const PROC_LABEL = { musicdl: "musicdl", musicbox: "musicbox", lxmusic: "lxmusic
 const PLATFORM_LABEL = { tx: "QQ音乐", wy: "网易云", kw: "酷我", kg: "酷狗", mg: "咪咕" };
 const ALL_PLATFORMS = ["tx", "wy", "kw", "kg", "mg"];
 const CATEGORY_PLATFORMS = ["tx", "wy", "kw", "kg"];  // 咪咕无分类体系
+const CHART_PLATFORMS = ["tx", "wy", "kg", "kw"];   // 支持排行榜的平台（咪咕无榜单）
 
 // 平台歌单设置的多选状态（与 .env 的 csv 字段双向映射）
 const state = {
   playlistSource: [],     // 选中的平台 code，如 ["tx","kg"]；空 = 不注入任何平台
   playlistCategory: [],   // 选中的分类，形如 ["tx:11","kg:12"]
+  playlistCharts: [],     // 选中的排行榜，形如 ["tx:26","wy:19723756"]
   categoryData: null,     // /api/playlist-categories 的返回（懒加载一次）
+  chartData: null,        // /api/playlist-charts 的返回（懒加载一次）
 };
 
 let configValues = {};   // GET /api/config 的 values
@@ -135,8 +138,12 @@ function applyConfigToForm() {
   $("#recommend-playlist").checked = v.FNMUSIC_RECOMMEND_PLAYLIST === "true";
   state.playlistSource = splitCsv(v.FNMUSIC_RECOMMEND_PLAYLIST_SOURCE);
   state.playlistCategory = splitCsv(v.FNMUSIC_RECOMMEND_PLAYLIST_CATEGORY);
+  state.playlistCharts = splitCsv(v.FNMUSIC_RECOMMEND_CHARTS_LIST);
+  $("#recommend-charts").checked = v.FNMUSIC_RECOMMEND_CHARTS === "true";
   renderSourceChips();
   ensureCategoryData().then(renderCategoryChips);
+  ensureChartData().then(renderChartChips);
+  updateChartDetailVisibility();
   updatePlaylistDetailVisibility();
   $("#recommend-playlist-size").value = v.FNMUSIC_RECOMMEND_PLAYLIST_PAGE_SIZE || "12";
   $("#tee-enabled").checked = v.FNMUSIC_TEE_SAVE_ENABLED === "true";
@@ -196,6 +203,8 @@ function collectConfig() {
     FNMUSIC_RECOMMEND_PLAYLIST: $("#recommend-playlist").checked,
     FNMUSIC_RECOMMEND_PLAYLIST_SOURCE: state.playlistSource.join(","),
     FNMUSIC_RECOMMEND_PLAYLIST_CATEGORY: state.playlistCategory.join(","),
+    FNMUSIC_RECOMMEND_CHARTS: $("#recommend-charts").checked,
+    FNMUSIC_RECOMMEND_CHARTS_LIST: state.playlistCharts.join(","),
     FNMUSIC_RECOMMEND_PLAYLIST_PAGE_SIZE: parseInt($("#recommend-playlist-size").value || "12", 10) || 12,
     FNMUSIC_TEE_SAVE_ENABLED: $("#tee-enabled").checked,
     FNMUSIC_AUTO_COVER: $("#auto-cover").checked,
@@ -353,6 +362,14 @@ function updatePlaylistDetailVisibility() {
   wrap.style.display = sw.checked ? "" : "none";
 }
 
+function updateChartDetailVisibility() {
+  // 排行榜总开关关闭时隐藏「选择榜单」细节区（与平台歌单同款交互）。
+  const wrap = $("#chart-detail-wrap");
+  const sw = $("#recommend-charts");
+  if (!wrap || !wrap.style || !sw) return;
+  wrap.style.display = sw.checked ? "" : "none";
+}
+
 function visiblePlaylistPlatforms() {
   // 仅展示当前洛雪源实际支持的平台（来自 /api/status 的 lx_source.source.platforms）；
   // null/空 表示尚未拿到源信息（非 lx 提供方 / 状态未加载）——回退全量展示。
@@ -456,6 +473,59 @@ function renderCategoryChips() {
       state.playlistCategory = Array.from(set);
       chip.classList.toggle("on");
       markDirty("歌单分类已修改");
+    }));
+}
+
+async function ensureChartData() {
+  if (state.chartData) return state.chartData;
+  try {
+    state.chartData = await api("/api/playlist-charts");
+  } catch (err) {
+    state.chartData = { ok: false, charts: {}, error: String(err && err.message || err) };
+  }
+  return state.chartData;
+}
+
+function renderChartChips() {
+  // 排行榜多选：与平台/分类独立（不受平台白名单影响）。key 形如 "tx:26"。
+  const body = $("#playlist-chart-body");
+  if (!body) return;
+  const data = state.chartData;
+  if (!data) { body.innerHTML = `<p class="hint">正在加载榜单…</p>`; return; }
+  const charts = data.charts || {};
+  const active = CHART_PLATFORMS.filter((p) => (charts[p] || []).length);
+  if (!active.length) {
+    body.innerHTML = `<p class="hint">榜单暂不可用：${data.error || "上游未返回且无兜底"}。稍后重试即可。</p>`;
+    return;
+  }
+  const on = new Set(state.playlistCharts);
+  const blocks = active.map((p) => {
+    const rows = charts[p] || [];
+    const groups = [];
+    rows.forEach((c) => {
+      const g = c.group || "榜单";
+      let slot = groups.find((x) => x.name === g);
+      if (!slot) { slot = { name: g, items: [] }; groups.push(slot); }
+      slot.items.push(c);
+    });
+    const inner = groups.map((g) => `
+      <div class="cat-group"><span class="cat-group-name">${g.name}</span>
+        <div class="chip-grid">${g.items.map((c) => {
+          const key = `${p}:${c.id}`;
+          return `<span class="chip ${on.has(key) ? "on" : ""}" data-chart="${key}">${c.name}</span>`;
+        }).join("")}</div>
+      </div>`).join("");
+    return `<div class="cat-block"><div class="cat-head">${PLATFORM_LABEL[p] || p}<small>${p}</small></div>${inner}</div>`;
+  });
+  body.innerHTML = blocks.join("");
+  body.querySelectorAll(".chip[data-chart]").forEach((chip) =>
+    chip.addEventListener("click", () => {
+      const key = chip.dataset.chart;
+      const set = new Set(state.playlistCharts);
+      if (set.has(key)) set.delete(key); else set.add(key);
+      state.playlistCharts = Array.from(set);
+      chip.classList.toggle("on");
+      markDirty("排行榜已修改");
     }));
 }
 
@@ -839,6 +909,7 @@ $$("input[name=quality]").forEach((el) => el.addEventListener("change", () => ma
 ["#recommend-hot", "#recommend-daily", "#recommend-playlist", "#search-probe", "#search-deep", "#tee-enabled", "#fav-autobind", "#auto-cover", "#lyric-auto-dl", "#netease-my-playlists"].forEach((sel) =>
   $(sel).addEventListener("change", () => markDirty()));
 $("#recommend-playlist").addEventListener("change", updatePlaylistDetailVisibility);
+$("#recommend-charts").addEventListener("change", updateChartDetailVisibility);
 ["#recommend-playlist-size"].forEach((sel) =>
   $(sel).addEventListener("input", () => markDirty()));
 

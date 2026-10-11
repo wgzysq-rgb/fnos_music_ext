@@ -38,6 +38,7 @@ try:
     from . import recommend as dailyrec
     from . import nmplaylists as nmpl
     from . import platform_playlists as plpl
+    from . import platform_charts as pchart
     from . import online_registry as onreg
     from . import transcode as tc
     from .cache_gc import purge_rolling, sweep_orphan_lyrics
@@ -47,6 +48,7 @@ except ImportError:  # uvicorn --app-dir proxy
     import recommend as dailyrec  # type: ignore
     import nmplaylists as nmpl  # type: ignore
     import platform_playlists as plpl  # type: ignore
+    import platform_charts as pchart  # type: ignore
     import online_registry as onreg  # type: ignore
     import transcode as tc  # type: ignore
     from cache_gc import purge_rolling, sweep_orphan_lyrics  # type: ignore
@@ -201,6 +203,11 @@ CONF = {
     # 歌单分类筛选（csv，格式 <平台>:<分类id>，如 tx:11,tx:194,kg:12）。
     # 空 = 各平台「全部」，与原行为完全一致；非空时每个分类各取 page_size 条后合并去重。
     "recommend_playlist_category": (os.environ.get("FNMUSIC_RECOMMEND_PLAYLIST_CATEGORY") or "").strip(),
+    # 排行榜（榜单）注入（v2.8.13）：总开关 + 勾选清单。
+    # `recommend_charts`=bool 总开关（设置页「平台排行榜」）；`recommend_charts_list`
+    # =csv 勾选榜单（格式 <平台>:<榜单id>，如 tx:26,wy:19723756，空=一个都不注入）。
+    "recommend_charts": os.environ.get("FNMUSIC_RECOMMEND_CHARTS", "false").lower() in ("true", "1", "yes"),
+    "recommend_charts_list": (os.environ.get("FNMUSIC_RECOMMEND_CHARTS_LIST") or "").strip(),
     # 网易账号歌单注入（2.6.0）：默认关；需网易盒子启用并扫码登录，
     # 音乐页在热门推荐与官方歌单之间展示账号自建歌单（只读，不回写网易）
     "netease_my_playlists": os.environ.get("FNMUSIC_NETEASE_MY_PLAYLISTS", "false").lower() in ("true", "1", "yes"),
@@ -529,6 +536,8 @@ _ENV_WATCH_KEYS: dict[str, tuple[str, str]] = {
     "FNMUSIC_RECOMMEND_PLAYLIST_SOURCE": ("recommend_playlist_source", "str"),
     "FNMUSIC_RECOMMEND_PLAYLIST_PAGE_SIZE": ("recommend_playlist_page_size", "pl_page_size"),
     "FNMUSIC_RECOMMEND_PLAYLIST_CATEGORY": ("recommend_playlist_category", "str"),
+    "FNMUSIC_RECOMMEND_CHARTS": ("recommend_charts", "bool"),
+    "FNMUSIC_RECOMMEND_CHARTS_LIST": ("recommend_charts_list", "str"),
     "FNMUSIC_NETEASE_MY_PLAYLISTS": ("netease_my_playlists", "bool"),
     "FNMUSIC_COVER_DIR": ("cover_dir", "str"),
     "FNMUSIC_COVER_PROXY": ("cover_proxy", "bool"),
@@ -674,13 +683,15 @@ _SOURCE_CONF_KEYS = {"musicdl_enabled", "netease_enabled", "lx_enabled", "online
 _DISCOVER_CONF_KEYS = {
     "recommend_playlist", "recommend_playlist_source",
     "recommend_playlist_page_size", "recommend_playlist_category",
+    "recommend_charts", "recommend_charts_list",
 }
 
 
 def _reset_discover_cache() -> None:
-    """清空推荐歌单卡片/曲目缓存（配置变化后立即重建）。"""
+    """清空推荐歌单卡片/曲目缓存 + 榜单列表缓存（配置变化后立即重建）。"""
     _DISCOVER_CACHE.clear()
     _DISCOVER_TRACK_CACHE.clear()
+    _CHART_LIST_CACHE.clear()
 
 
 def _cancel_daily_tasks() -> None:
@@ -2488,12 +2499,22 @@ def quality_order(ladder: "list[str] | tuple[str, ...]", mode: "str | None", pri
     return [seq[idx]] + list(reversed(seq[:idx]))
 
 
-async def resolve_lx_url(client: httpx.AsyncClient, song_id: str) -> "dict | None":
-    """洛雪音乐源直链解析：song_id 形如 "lx:kg:<hash>"。"""
-    primary = str(CONF.get("lx_quality") or "lossless").strip()
-    qualities = quality_order(_LX_QUALITY_LADDER, CONF.get("quality_mode"), primary)
-    if primary and primary not in qualities:
-        qualities.insert(0, primary)
+async def resolve_lx_url(client: httpx.AsyncClient, song_id: str,
+                         avoid_lossless: bool = False) -> "dict | None":
+    """洛雪音乐源直链解析：song_id 形如 "lx:kg:<hash>"。
+
+    avoid_lossless=True 时跳过无损档（改取 standard→high 有损档）：某些平台
+    （实测 tx/部分 kg）的无损直链**能解析、能下满，但内容损坏**——ffmpeg 报
+    "invalid sync code"、解码校验不通过 → 落盘被拒 → 永远存不下来。此时必须换有损
+    档重取，否则一个能播的文件都存不下。
+    """
+    if avoid_lossless:
+        qualities = ["standard", "high"]
+    else:
+        primary = str(CONF.get("lx_quality") or "lossless").strip()
+        qualities = quality_order(_LX_QUALITY_LADDER, CONF.get("quality_mode"), primary)
+        if primary and primary not in qualities:
+            qualities.insert(0, primary)
 
     last_status: "int | str" = "none"
     for q in qualities:
@@ -4393,12 +4414,42 @@ async def _recover_source(request: Request, guid: str, entry: dict | None) -> bo
         _FETCH_SCOPE.reset(token)
 
 
-# 洛雪直链多走各平台 CDN；部分（如酷我 kuwo）会反爬非浏览器 UA。流式下发
-# 必须带浏览器标识，否则取流被拒、App 跳曲（bug B 根因，2026-10-11 实锤）。
+# 洛雪直链多走各平台 CDN；部分（如酷我 kuwo、酷狗 kugou）会反爬非浏览器 UA /
+# 防盗链 Referer。lxserver 解析通常不回这些头（kw 即如此，见 bug B 实锤），代理
+# 必须按平台补齐，否则取流被拒、App 跳曲 / 后台整轨下载抛 RuntimeError。
+# 仅在 resolved 未提供时补齐，绝不覆盖音源自带头。
 _BROWSER_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/128.0 Safari/537.36"
 )
+_LX_REFERER = {
+    "kw": "https://www.kuwo.cn/",
+    "kg": "https://www.kugou.com/",
+}
+
+
+def _lx_stream_headers(guid: str, resolved: "dict | None" = None) -> dict:
+    """洛雪直链取流/转码共用的请求头：浏览器 UA + 平台防盗链 Referer。
+
+    lxserver 解析通常不回这些头（kw/kg 即如此），各平台 CDN 会反爬非浏览器 UA /
+    防盗链 Referer。**流式下发（`_open_online_stream`）与转码输入（`_transcode_source`
+    喂给 ffmpeg）必须用同一套头**：否则标准音质走转码会漏掉修复、ffmpeg 取流被拒 →
+    转码失败 → App 跳曲（bug B 的同源遗漏，2026-10-11 实锤）。resolved 已带的不覆盖。
+    """
+    headers: dict = {}
+    for key, value in ((resolved or {}).get("headers") or {}).items():
+        k = str(key).lower()
+        if k == "referer":
+            headers["Referer"] = str(value)
+        elif k == "user-agent":
+            headers["User-Agent"] = str(value)
+    headers.setdefault("User-Agent", _BROWSER_UA)
+    sid = song_id_from_online_guid(guid)
+    plat = sid.split(":", 2)[1] if sid.startswith("lx:") else ""
+    ref = _LX_REFERER.get(plat)
+    if ref:
+        headers.setdefault("Referer", ref)
+    return headers
 
 
 async def _open_online_stream(request: Request, guid: str, range_header: str | None,
@@ -4420,7 +4471,12 @@ async def _open_online_stream(request: Request, guid: str, range_header: str | N
                 if not url:
                     return None
             else:
-                resolved = await resolve_lx_url(get_lx_client(request.app), song_id_from_online_guid(guid))
+                # 无损档损坏（黑名单）或调用方强制 mp3 时，跳过 lossless 取有损档：
+                # 否则会反复下满一个损坏的 flac、解码校验被拒、永远存不下来。
+                resolved = await resolve_lx_url(
+                    get_lx_client(request.app), song_id_from_online_guid(guid),
+                    avoid_lossless=force_mp3 or _lossless_is_blacklisted(guid),
+                )
                 if not resolved:
                     return None
                 url = resolved["url"]
@@ -4428,12 +4484,11 @@ async def _open_online_stream(request: Request, guid: str, range_header: str | N
                 for key, value in (resolved.get("headers") or {}).items():
                     if key.lower() in ("referer", "user-agent"):
                         headers[key] = str(value)
-                # bug B 修复：resolved 未返回 UA/Referer（kw 即如此）时，流式 fetch
-                # 默认用 httpx UA 被 kuwo 反爬拦掉 → 取流失败 → App 跳曲。统一补浏览器
-                # 标识，与代理封面段 kuwo headers 保持同款（见 proxy/app.py:6240）。
-                headers.setdefault("User-Agent", _BROWSER_UA)
-                if song_id_from_online_guid(guid).startswith("lx:kw"):
-                    headers.setdefault("Referer", "https://www.kuwo.cn/")
+                # bug B / kugou 修复：lxserver 解析通常不回 UA/Referer（kw/kg 即如此），
+                # 流式 fetch 默认 httpx UA / 无防盗链 Referer 会被各平台 CDN 反爬挡掉 →
+                # 取流失败 → App 跳曲 / 后台整轨下载抛 RuntimeError。与转码输入路径
+                # （_transcode_source）共用同一套头，见 _lx_stream_headers()。
+                headers.update(_lx_stream_headers(guid, resolved))
             if info is None:
                 try:
                     info = await asyncio.wait_for(_fetch_online_info(request, guid), timeout=0.75)
@@ -4528,7 +4583,15 @@ def _audio_file_ok(path: str) -> bool:
             [tc.FFMPEG_BIN, "-v", "error", "-nostdin", "-i", path, "-f", "null", "-"],
             capture_output=True, text=True, timeout=300,
         )
-        return r.returncode == 0 and not (r.stderr or "").strip()
+        ok = r.returncode == 0 and not (r.stderr or "").strip()
+        if not ok:
+            # 留底：此前只报"校验失败"不报原因，无法区分"真损坏"还是"误判"。
+            reason = (r.stderr or "").strip().replace("\n", " ")[:240]
+            logger.warning(
+                "audio decode check failed for %s: rc=%s %s",
+                os.path.basename(path), r.returncode, reason,
+            )
+        return ok
     except Exception:  # noqa: BLE001
         return False
 
@@ -4686,7 +4749,12 @@ async def _full_fetch_download(guid: str, cred_headers: dict, force_mp3: bool = 
         raise
     except Exception as e:
         _full_fetch_failed[guid] = time.monotonic()
-        logger.warning("Background full fetch failed for %s: %s", guid, type(e).__name__)
+        # 把底层原因一并打出来，区分"取流被拒(open failed)"/"字节数不符(size mismatch)"
+        # /"无损档损坏(corrupt stream even at mp3 tier)"，下次排查不必再靠猜。
+        logger.warning(
+            "Background full fetch failed for %s: %s: %s",
+            guid, type(e).__name__, e,
+        )
     finally:
         if part and os.path.exists(part):
             try:
@@ -5081,11 +5149,17 @@ async def _bind_official_task(guid: str, user_guid: str, meta: "dict | None") ->
     artist = str((meta or {}).get("artist") or "")
     album = str((meta or {}).get("album") or "")
     if not (title.strip() and artist.strip()):
-        snap = _lookup_online_snapshot(guid)
-        snap = _snapshot_to_info(snap) if isinstance(snap, dict) and snap else {}
-        title = title.strip() or str(snap.get("title") or "")
-        artist = artist.strip() or str(snap.get("artist") or "")
-        album = album.strip() or str(snap.get("album") or "")
+        # 与落盘命名 / 列表 heal 同源的完整回退链：在线登记表(REGISTRY) → 推荐/网易/广场
+        # 歌单磁盘缓存 → 收藏/历史快照。此前只查快照自身，一旦收藏快照存空就会被永久
+        # 跳过绑定（曲目停留在 online/lx/... 在线引用态，即使音频字节已落盘）。
+        snapshot = _lookup_online_snapshot(guid)
+        snapshot = _snapshot_to_info(snapshot) if isinstance(snapshot, dict) and snapshot else {}
+        for cand in (_registry_apply(guid, None), _lookup_playlist_cache_track(guid), snapshot):
+            if not isinstance(cand, dict) or not cand:
+                continue
+            title, artist, album = _merge_missing_tags(title, artist, album, cand)
+            if title.strip() and artist.strip():
+                break
     if not (title.strip() and artist.strip()):
         logger.info("Official bind skip for %s: no usable metadata", guid)
         return
@@ -5512,12 +5586,16 @@ async def _transcode_source(request: Request, guid: str) -> "tuple[str | None, d
                 get_musicbox_client(request.app), song_id_from_online_guid(guid).split(":")[-1])
             return (url or None, None)
         if source == "lx":
-            resolved = await resolve_lx_url(get_lx_client(request.app), song_id_from_online_guid(guid))
+            # 无损档已被判定损坏时，转码输入也必须有损档：ffmpeg 编到坏点会直接失败。
+            resolved = await resolve_lx_url(
+                get_lx_client(request.app), song_id_from_online_guid(guid),
+                avoid_lossless=_lossless_is_blacklisted(guid),
+            )
             if not resolved or not resolved.get("url"):
                 return None, None
-            headers = {k: str(v) for k, v in (resolved.get("headers") or {}).items()
-                       if k.lower() in ("referer", "user-agent")}
-            return str(resolved["url"]), headers or None
+            # 转码输入（标准音质）走 ffmpeg 拉直链：必须带与流式下发同款的浏览器 UA +
+            # 平台防盗链 Referer，否则 kw/kg 的 CDN 反爬会拒掉 ffmpeg → 转码失败 → App 跳曲。
+            return str(resolved["url"]), _lx_stream_headers(guid, resolved)
         url = f"{str(CONF['musicdl_url']).rstrip('/')}/stream?id={quote(song_id_from_online_guid(guid))}&proxy=true"
         if _lossless_is_blacklisted(guid):
             url += "&quality=mp3"
@@ -6931,6 +7009,12 @@ async def _best_effort_online_info(request: Request, guid: str) -> dict:
                 else:
                     file_snap = {"title": base}
                 title, artist, album = _merge_missing_tags(title, artist, album, file_snap)
+    if not (_is_real_tag(title) and _is_real_tag(artist)):
+        # 收藏/歌单附加记录期补全：推荐/网易/广场歌单的曲目元数据只落在磁盘缓存里
+        # （从未走搜索，_SEARCH_CACHE 与实时取流都可能拿不到），与最近播放记录路径同源。
+        served = _lookup_playlist_cache_track(guid)
+        if served:
+            title, artist, album = _merge_missing_tags(title, artist, album, served)
     out = dict(info)
     if title:
         out["title"] = title
@@ -7377,6 +7461,90 @@ def _discover_sources() -> list[str]:
     return [s for s in wanted if s in plpl.SUPPORTED_PLATFORMS]
 
 
+def _discover_chart_entries() -> list[tuple[str, str]]:
+    """勾选的排行榜 → [(source, chart_id)]（来自 FNMUSIC_RECOMMEND_CHARTS）。
+
+    格式 `<平台>:<榜单id>`，逗号分隔，如 `tx:26,tx:4,wy:19723756`。
+    **空 = 不注入任何榜单**（与平台白名单同款"空=无"语义）；平台须支持榜单。
+    """
+    raw = str(CONF.get("recommend_charts_list") or "").strip()
+    if not raw:
+        return []
+    out: list[tuple[str, str]] = []
+    for item in raw.replace("，", ",").split(","):
+        piece = item.strip()
+        if not piece or ":" not in piece:
+            continue
+        p, _, cid = piece.partition(":")
+        p = p.strip().lower()
+        cid = cid.strip()
+        if p in pchart.CHART_PLATFORMS and cid and (p, cid) not in out:
+            out.append((p, cid))
+    return out
+
+
+# 榜单列表进程内缓存：平台榜单变动很慢，避免每次组装歌单列表都打上游。
+_CHART_LIST_CACHE: dict[str, tuple[float, list]] = {}
+_CHART_LIST_TTL_S = 3600.0
+
+
+async def _fetch_platform_charts_cached(source: str) -> list[dict]:
+    now = time.time()
+    hit = _CHART_LIST_CACHE.get(source)
+    if hit and now - hit[0] < _CHART_LIST_TTL_S:
+        return hit[1]
+    # tx/wy 走平台官方接口；kg/kw 走 lxmusic-service 榜单通道（lx_base 绝对地址）
+    rows = await pchart.fetch_platform_charts(
+        get_platform_client(app), source, lx_base=str(CONF.get("lx_url") or ""))
+    if rows:
+        _CHART_LIST_CACHE[source] = (time.time(), rows)
+    return rows
+
+
+async def _load_discover_charts() -> list[dict]:
+    """已勾选榜单 → 虚拟歌单卡（与 _discover_platform_cards 同形状）。
+
+    名字/封面从各平台榜单列表按 id 反查；查不到时用「平台标签+榜单id」兜底。
+    playlistId 记为 `chart_<id>`，由 `_load_discover_tracks` 识别前缀走榜单取曲目。
+    """
+    # 必须同时满足「排行榜总开关开」+「勾了榜单」——否则平台歌单开着时会连带注入榜单卡
+    if not CONF.get("recommend_charts"):
+        return []
+    entries = _discover_chart_entries()
+    if not entries:
+        return []
+    by_source: dict[str, list[str]] = {}
+    for src, cid in entries:
+        by_source.setdefault(src, []).append(cid)
+    lists = await asyncio.gather(
+        *(_fetch_platform_charts_cached(s) for s in by_source), return_exceptions=True
+    )
+    meta: dict[tuple[str, str], dict] = {}
+    for src, rows in zip(by_source, lists):
+        if isinstance(rows, Exception) or not rows:
+            continue
+        for r in rows:
+            meta[(src, str(r.get("id") or ""))] = r
+    out: list[dict] = []
+    for src, cid in entries:
+        info = meta.get((src, cid)) or {}
+        label = plpl.platform_label(src)
+        name = str(info.get("name") or "").strip() or f"{label}榜单{cid}"
+        pid = f"chart_{cid}"
+        out.append({
+            "guid": dailyrec.discover_playlist_guid(src, pid),
+            "name": name,
+            "coverUrl": str(info.get("cover") or ""),
+            "trackCount": int(info.get("total") or 0),
+            "author": label,
+            "playCount": "",
+            "desc": str(info.get("group") or "") or f"{label}排行榜",
+            "source": src,
+            "playlistId": pid,
+        })
+    return out
+
+
 # 卡片元数据落盘索引：discover guid → {name, coverUrl, author, ...}。
 #
 # 为什么必须落盘：卡片本身的抓取缓存（_DISCOVER_CACHE）是**进程内**的，重启即空，
@@ -7603,18 +7771,24 @@ async def _fetch_discover_cards(source: str) -> list[dict]:
 
 
 async def _load_discover_playlists() -> list[dict]:
-    """汇总所有启用平台的推荐歌单卡（App 歌单列表用）。"""
-    sources = _discover_sources()
-    if not sources:
-        return []
-    results = await asyncio.gather(
-        *(_fetch_discover_cards(s) for s in sources), return_exceptions=True
-    )
+    """汇总所有启用平台的推荐歌单卡 + 已勾选排行榜卡（App 歌单列表用）。
+
+    平台歌单与排行榜是**独立开关**：只勾排行榜、不勾平台歌单时也照样注入；
+    反之关了平台歌单总开关就**不得**再注入平台卡（即便平台白名单/分类仍留着）。
+    """
     out: list[dict] = []
-    for source, cards in zip(sources, results):
-        if isinstance(cards, Exception) or not cards:
-            continue
-        out.extend(_discover_platform_cards(source, cards))
+    # 平台卡必须受「平台推荐歌单」总开关约束：只保留白名单不够——用户关掉总开关
+    # 但白名单/分类还在时，绝不能再注入（2.8.12 引入的回归）。
+    sources = _discover_sources() if _discover_enabled() else []
+    if sources:
+        results = await asyncio.gather(
+            *(_fetch_discover_cards(s) for s in sources), return_exceptions=True
+        )
+        for source, cards in zip(sources, results):
+            if isinstance(cards, Exception) or not cards:
+                continue
+            out.extend(_discover_platform_cards(source, cards))
+    out.extend(await _load_discover_charts())
     # 记下真名/封面/作者：歌单列表之外（playlist/detail、batch-detail、重启后）
     # 还要靠这份索引还原歌单名，否则只剩硬编码的「XX音乐推荐歌单」。
     if out:
@@ -7629,8 +7803,15 @@ async def _load_discover_tracks(source: str, playlist_id: str) -> list[dict]:
     cached = _DISCOVER_TRACK_CACHE.get(key)
     if cached and now - cached[0] < _DISCOVER_TRACK_TTL_S:
         return cached[1]
-    client = get_platform_client(app)
-    items = await plpl.fetch_playlist_tracks(client, source, playlist_id, 100)
+    pid = str(playlist_id or "")
+    if pid.startswith("chart_"):
+        # 排行榜卡：playlistId 形如 chart_<榜单id>，走榜单接口取曲目
+        items = await pchart.fetch_chart_tracks(
+            get_platform_client(app), source, pid[len("chart_"):], 100,
+            lx_base=str(CONF.get("lx_url") or ""))
+    else:
+        items = await plpl.fetch_playlist_tracks(
+            get_platform_client(app), source, playlist_id, 100)
     tracks = [t for t in (build_online_track(it) for it in items) if t]
     if not tracks:
         # 上游不可用（弱网/限流/风控）时用落盘曲目兜底，别让歌单整块空白
@@ -8171,7 +8352,8 @@ async def playlist_list(request: Request):
     # 网易账号歌单：实例级内容（同热门推荐），shared 会话同样可见
     nm_on = bool(CONF.get("netease_my_playlists")) and bool(CONF.get("netease_enabled"))
     # 平台推荐歌单（发现·歌单广场）：公共内容，不读个人历史/收藏，shared 会话同样可见
-    discover_on = _discover_enabled() and bool(_discover_sources())
+    charts_on = bool(CONF.get("recommend_charts")) and bool(_discover_chart_entries())
+    discover_on = (_discover_enabled() and bool(_discover_sources())) or charts_on
     if not kinds and not nm_on and not discover_on:
         # 推荐开关全关（或 shared 会话无任何可注入类型）且账号歌单/平台歌单关闭：不注入
         return JSONResponse(content=envelope, headers=headers)

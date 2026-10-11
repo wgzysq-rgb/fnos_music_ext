@@ -77,6 +77,8 @@ SCHEMA: dict[str, dict] = {
     "FNMUSIC_RECOMMEND_PLAYLIST_SOURCE": {"kind": "csv", "default": "", "group": "recommend", "reload": "hot", "label": "平台歌单平台白名单（空=不注入任何平台）"},
     "FNMUSIC_RECOMMEND_PLAYLIST_PAGE_SIZE": {"kind": "int", "default": "12", "min": 1, "max": 30, "group": "recommend", "reload": "hot", "label": "每平台歌单数量"},
     "FNMUSIC_RECOMMEND_PLAYLIST_CATEGORY": {"kind": "csv", "default": "", "group": "recommend", "reload": "hot", "label": "歌单分类（格式 平台:分类id）"},
+    "FNMUSIC_RECOMMEND_CHARTS": {"kind": "bool", "default": "false", "group": "recommend", "reload": "hot", "label": "平台排行榜（榜单）"},
+    "FNMUSIC_RECOMMEND_CHARTS_LIST": {"kind": "csv", "default": "", "group": "recommend", "reload": "hot", "label": "排行榜勾选（格式 平台:榜单id）"},
     "FNMUSIC_TEE_SAVE_ENABLED": {"kind": "bool", "default": "true", "group": "tee", "reload": "hot", "label": "边听边存"},
     "FNMUSIC_TEE_SAVE_DIR": {"kind": "str", "default": "", "group": "tee", "reload": "hot", "label": "保存路径（留空自动探测）"},
     "FNMUSIC_TEE_CACHE_MAX": {"kind": "int", "default": "2", "min": 1, "max": 100, "group": "tee", "reload": "hot", "label": "关闭时滚动缓存数"},
@@ -746,6 +748,61 @@ async def api_playlist_categories(request: Request, source: str = ""):
     return {"ok": True,
             "platforms": {k: plpl.PLATFORM_LABELS.get(k, k) for k in plpl.CATEGORY_PLATFORMS},
             "categories": out}
+
+
+# ------------------------------------------------------- 排行榜（榜单）多选 --
+
+_CHART_CACHE: dict[str, tuple[float, list]] = {}
+_CHART_CACHE_TTL_S = 3600.0
+
+
+@app.get("/api/playlist-charts")
+async def api_playlist_charts(request: Request, source: str = ""):
+    """某平台的排行榜列表（供设置页多选渲染）。source 为空返回全部支持榜单的平台。
+
+    复用 proxy.platform_charts（与代理注入同一份代码，避免两处漂移）；
+    上游不可用时平台层已内置兜底表，这里再兜一层异常 → 绝不 5xx。
+    """
+    try:
+        from proxy import platform_charts as pchart
+        from proxy import platform_playlists as plpl2
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("导入 platform_charts 失败: %s", exc)
+        return {"ok": False, "error": f"榜单模块不可用: {exc}", "charts": {}}
+
+    src = str(source or "").strip().lower()
+    client = get_http(request)
+    now = time.time()
+
+    async def _charts(s: str):
+        hit = _CHART_CACHE.get(s)
+        if hit and now - hit[0] < _CHART_CACHE_TTL_S:
+            return hit[1]
+        try:
+            # kg/kw 走 lxmusic-service 榜单通道（绝对 URL）；tx/wy 走平台接口
+            rows = await pchart.fetch_platform_charts(
+                client, s, lx_base=str(CONF.get("lx_url") or ""))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("拉取 %s 榜单失败: %s", s, exc)
+            rows = []
+        if rows:
+            _CHART_CACHE[s] = (time.time(), rows)
+        return rows
+
+    if src:
+        if src not in pchart.CHART_PLATFORMS:
+            return {"ok": True, "source": src, "charts": []}
+        return {"ok": True, "source": src, "charts": await _charts(src)}
+
+    results = await asyncio.gather(
+        *(_charts(s) for s in pchart.CHART_PLATFORMS), return_exceptions=True
+    )
+    out: dict[str, list] = {}
+    for s, rows in zip(pchart.CHART_PLATFORMS, results):
+        out[s] = [] if isinstance(rows, Exception) else rows
+    return {"ok": True,
+            "platforms": {k: plpl2.PLATFORM_LABELS.get(k, k) for k in pchart.CHART_PLATFORMS},
+            "charts": out}
 
 
 # ------------------------------------------------- 网易扫码（反代 musicbox） --
