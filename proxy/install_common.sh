@@ -252,6 +252,86 @@ env_newer_than_container() {
     [ "${epoch_env}" -gt "${epoch_start}" ]
 }
 
+# ------------------------------------------------------------ 镜像重建门禁 ----
+# 一次「应用中心安装」会跑两遍 `docker compose up -d --build`：install.sh 的
+# install_sources_container 一遍，紧接着 --extend 链到的 extend.sh
+# （ensure_image_current）又一遍。两遍用的是同一份代码、同一个镜像，而每次都要
+# 过 apt/pip 层，实测各 20~30s；此后每次「应用中心启动」还要再走一遍。
+#
+# 这里用「构建上下文指纹」挡掉无谓重建：只有真正进镜像的文件（与 .dockerignore
+# 白名单一致：四个服务目录 + container/ + proxy 的四个显式模块）或影响镜像层的
+# 构建参数变了，才 --build；否则退化成 `up -d`（秒级，只做容器状态对齐）。
+# 指纹失配 / 镜像不存在 / 指纹算不出来，一律 fail-open 走完整构建——
+# 宁可多等 30s，也绝不用旧镜像跑新代码。
+#
+# 与 `--force` 无关：--force 只强制重写 unit 并重启代理，不重建镜像。
+container_build_context_files() {
+    # 输出 "大小 修改时间 路径"，任一变化即指纹变化；筛选规则与 .dockerignore 对齐。
+    local base="${BASE_DIR}" dir f
+    for dir in musicdl-service musicbox-service lxmusic-service webui-service container; do
+        [ -d "${base}/${dir}" ] || continue
+        find "${base}/${dir}" -type f \
+            ! -path '*/__pycache__/*' ! -name '*.pyc' \
+            ! -path '*/.pytest_cache/*' ! -name 'test_*.py' ! -name '*.md' \
+            -printf '%s %T@ %p\n' 2>/dev/null || true
+    done
+    # proxy/ 只有这四个文件进镜像（见 Dockerfile 的 COPY ... /srv/proxy/ 清单）
+    for f in __init__.py env_merge.py platform_playlists.py platform_charts.py; do
+        [ -f "${base}/proxy/${f}" ] || continue
+        printf '%s %s %s\n' \
+            "$(stat -c %s "${base}/proxy/${f}" 2>/dev/null || echo '?')" \
+            "$(stat -c %Y "${base}/proxy/${f}" 2>/dev/null || echo '?')" \
+            "${base}/proxy/${f}"
+    done
+}
+
+container_build_fingerprint() {
+    # 上下文清单 + compose 文件 + 影响镜像层的构建参数。
+    # 清单为空（find 不支持 -printf 等）返回非 0，调用方据此走完整构建。
+    local base="${BASE_DIR}" k val files
+    files="$(container_build_context_files | LC_ALL=C sort)"
+    [ -n "${files}" ] || return 1
+    {
+        printf '## compose-file\n'
+        cat "${base}/docker-compose.yml" 2>/dev/null || true
+        printf '## build-args\n'
+        for k in FNMUSIC_BASE_IMAGE FNMUSIC_PIP_INDEX FNMUSIC_APT_MIRROR; do
+            val="$(sed -n "s/^[[:space:]]*${k}=//p" "${base}/.env" 2>/dev/null | tail -n1 || true)"
+            printf '%s=%s\n' "${k}" "${val}"
+        done
+        printf '## context-files\n%s\n' "${files}"
+    }
+}
+
+container_build_fingerprint_path() {
+    printf '%s/.container-build-fingerprint' "${BASE_DIR}"
+}
+
+compose_up_build_gated() {
+    # 返回 0 = compose 启动成功；非 0 = 失败，由调用方报错并给排查指引。
+    local image="${CONTAINER_NAME:-fnmusic-sources}:latest"
+    local fp_file cur prev
+    fp_file="$(container_build_fingerprint_path)"
+    cur="$(container_build_fingerprint 2>/dev/null || true)"
+    if [ -n "${cur}" ] && [ -f "${fp_file}" ]; then
+        prev="$(cat "${fp_file}" 2>/dev/null || true)"
+        if [ "${cur}" = "${prev}" ] && run_docker image inspect "${image}" >/dev/null 2>&1; then
+            log_info "构建上下文与上次一致，跳过镜像重建（docker compose up -d）。"
+            if run_docker compose -f "${BASE_DIR}/docker-compose.yml" up -d; then
+                return 0
+            fi
+            log_warn "跳过重建的 compose 启动未成功，回退完整构建重试..."
+        fi
+    fi
+    # issue #24：构建日志逐层可见（非 tty 下默认进度条会被压成静默，看似"卡在 55%"）
+    export BUILDKIT_PROGRESS="${BUILDKIT_PROGRESS:-plain}"
+    run_docker compose -f "${BASE_DIR}/docker-compose.yml" up -d --build || return 1
+    if [ -n "${cur}" ]; then
+        printf '%s\n' "${cur}" > "${fp_file}" 2>/dev/null || true
+    fi
+    return 0
+}
+
 diagnose_sources_container() {
     # healthz 超时取证：supervisor 进程状态 + 容器日志尾部随安装日志落盘，
     # 让「进程集与 .env 不一致 / 程序启动失败」一眼可辨（issue 反馈可直接贴）。

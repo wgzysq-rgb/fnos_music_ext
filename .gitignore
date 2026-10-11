@@ -34,5 +34,6 @@ TASK_*.md
 .tools/
 dist/
 packaging/fpk/.build/
+.container-build-fingerprint
 
 .cursor/

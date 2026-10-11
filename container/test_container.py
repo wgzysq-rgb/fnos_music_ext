@@ -5,6 +5,7 @@
 import configparser
 import os
 import re
+import shutil
 import subprocess
 import textwrap
 from pathlib import Path
@@ -442,3 +443,169 @@ def test_dockerfile_copies_proxy_modules_imported_by_services():
                 mod = f"proxy/{m.group(1)}.py"
                 assert mod in copied, f"{service_dir}/{py.name} import {mod}，Dockerfile 需 COPY 进镜像"
                 assert f"!{mod}" in ignore, f"{mod} 被 .dockerignore 排除，构建上下文拿不到"
+
+
+# --------------------------------------------------- compose 镜像重建门禁（性能）
+# 一次「应用中心安装」会跑两遍 `docker compose up -d --build`：install.sh 的
+# install_sources_container 一遍，紧接着 --extend 链到的 extend.sh
+# （ensure_image_current）又一遍；两遍是同一份代码、同一个镜像，各要 20~30s。
+# proxy/install_common.sh 的 compose_up_build_gated 用「构建上下文指纹」挡掉无谓重建，
+# 这里用真 bash + run_docker 桩验证它的判定矩阵（不碰宿主 docker）。
+
+BASH = shutil.which("bash")
+
+_GATE_STUB = textwrap.dedent("""\
+    set -u
+    BASE_DIR="$1"
+    RUN_LOG="$2"
+    CONTAINER_NAME="fnmusic-sources"
+    run_docker() {
+        printf '%s\\n' "$*" >> "${RUN_LOG}"
+        if [ "$1" = image ]; then
+            [ "${IMAGE_EXISTS:-1}" = 1 ] || return 1
+            return 0
+        fi
+        if [ "$1" = compose ]; then
+            case " $* " in
+              *" --build "*) return "${UP_BUILD_RC:-0}" ;;
+              *) return "${UP_NOBUILD_RC:-0}" ;;
+            esac
+        fi
+        return 0
+    }
+    log_info() { printf 'INFO %s\\n' "$*" >> "${RUN_LOG}"; }
+    log_warn() { printf 'WARN %s\\n' "$*" >> "${RUN_LOG}"; }
+    . "${FNMUSIC_INSTALL_COMMON}"
+    # 连续跑 N 次，模拟「安装 → 应用中心启动」里 install.sh / extend.sh 各一次 compose
+    _i=0
+    while [ "${_i}" -lt "${GATE_RUNS:-1}" ]; do
+        compose_up_build_gated
+        printf 'rc=%s\\n' "$?" >> "${RUN_LOG}"
+        _i=$((_i + 1))
+    done
+""")
+
+
+def _fake_repo(tmp_path: Path) -> Path:
+    """最小构建上下文：一个服务目录 + container/ + proxy 白名单文件 + compose/.env。"""
+    base = tmp_path / "repo"
+    (base / "musicdl-service").mkdir(parents=True)
+    (base / "container").mkdir()
+    (base / "proxy").mkdir()
+    (base / "musicdl-service" / "app.py").write_text("print('v1')\n", encoding="utf-8")
+    (base / "container" / "Dockerfile").write_text("FROM scratch\n", encoding="utf-8")
+    (base / "proxy" / "__init__.py").write_text("", encoding="utf-8")
+    (base / "docker-compose.yml").write_text("services: {}\n", encoding="utf-8")
+    (base / ".env").write_text("FNMUSIC_BASE_IMAGE='python:3.13-slim'\n", encoding="utf-8")
+    return base
+
+
+def _run_gate(base: Path, log: Path, runs: int = 1, env_extra: dict | None = None) -> str:
+    env = dict(os.environ)
+    env["FNMUSIC_INSTALL_COMMON"] = str(REPO_ROOT / "proxy" / "install_common.sh")
+    env["GATE_RUNS"] = str(runs)
+    env.update(env_extra or {})
+    proc = subprocess.run(
+        [BASH, "-c", _GATE_STUB, "bash", base.as_posix(), log.as_posix()],
+        capture_output=True, text=True, timeout=120, env=env,
+    )
+    assert proc.returncode == 0, proc.stderr
+    return log.read_text(encoding="utf-8")
+
+
+def _builds(out: str) -> list[str]:
+    return [ln for ln in out.splitlines() if ln.startswith("compose ") and "--build" in ln]
+
+
+def _plain_starts(out: str) -> list[str]:
+    return [ln for ln in out.splitlines() if ln.startswith("compose ") and "--build" not in ln]
+
+
+GATE = pytest.mark.skipif(BASH is None, reason="需要 bash 执行 install_common.sh")
+
+
+@GATE
+def test_build_gate_builds_then_skips_within_one_install(tmp_path):
+    """安装链路的两次 compose（install.sh → extend.sh）：首次建镜像并记指纹，第二次跳过。
+
+    这正是本机实测到的 21:12 与 21:13 两次各 20~30s 的重复构建。
+    """
+    base, log = _fake_repo(tmp_path), tmp_path / "gate.log"
+    out = _run_gate(base, log, runs=2)
+    assert len(_builds(out)) == 1, "同一上下文第二次不该再 --build"
+    assert len(_plain_starts(out)) == 1
+    assert "跳过镜像重建" in out
+    assert out.count("rc=0") == 2
+    assert (base / ".container-build-fingerprint").is_file()
+
+
+@GATE
+def test_build_gate_rebuilds_when_shipped_context_changes(tmp_path):
+    """服务目录里的文件进了镜像 → 变了必须重建。"""
+    base, log = _fake_repo(tmp_path), tmp_path / "gate.log"
+    _run_gate(base, log)
+    (base / "musicdl-service" / "app.py").write_text("print('v2 changed')\n", encoding="utf-8")
+    log.unlink()
+    assert len(_builds(_run_gate(base, log))) == 1
+
+
+@GATE
+def test_build_gate_ignores_proxy_modules_not_shipped_in_image(tmp_path):
+    """proxy/app.py 只跑在宿主机、不进镜像 → 它变了不该触发容器重建。"""
+    base, log = _fake_repo(tmp_path), tmp_path / "gate.log"
+    (base / "proxy" / "app.py").write_text("x = 1\n", encoding="utf-8")
+    _run_gate(base, log)
+    (base / "proxy" / "app.py").write_text("x = 2\n", encoding="utf-8")
+    log.unlink()
+    out = _run_gate(base, log)
+    assert _builds(out) == []
+    assert "跳过镜像重建" in out
+
+
+@GATE
+def test_build_gate_rebuilds_when_build_arg_changes(tmp_path):
+    base, log = _fake_repo(tmp_path), tmp_path / "gate.log"
+    _run_gate(base, log)
+    (base / ".env").write_text("FNMUSIC_BASE_IMAGE='python:3.14-slim'\n", encoding="utf-8")
+    log.unlink()
+    assert len(_builds(_run_gate(base, log))) == 1
+
+
+@GATE
+def test_build_gate_rebuilds_when_image_missing(tmp_path):
+    """指纹匹配但镜像被删（docker rmi）时必须重建，不能 up -d 空转。"""
+    base, log = _fake_repo(tmp_path), tmp_path / "gate.log"
+    out = _run_gate(base, log, runs=2, env_extra={"IMAGE_EXISTS": "0"})
+    assert len(_builds(out)) == 2
+
+
+@GATE
+def test_build_gate_falls_back_to_build_when_plain_up_fails(tmp_path):
+    base, log = _fake_repo(tmp_path), tmp_path / "gate.log"
+    out = _run_gate(base, log, runs=2, env_extra={"UP_NOBUILD_RC": "1"})
+    assert "回退完整构建" in out
+    assert len(_plain_starts(out)) == 1 and len(_builds(out)) == 2
+    assert out.count("rc=0") == 2
+
+
+@GATE
+def test_build_gate_fails_open_when_fingerprint_unavailable(tmp_path):
+    """构建上下文清单为空（find 不可用等）→ 不给指纹，永远走完整构建。"""
+    base = tmp_path / "empty"
+    base.mkdir()
+    (base / "docker-compose.yml").write_text("services: {}\n", encoding="utf-8")
+    (base / ".env").write_text("FNMUSIC_BASE_IMAGE='python:3.13-slim'\n", encoding="utf-8")
+    out = _run_gate(base, tmp_path / "gate.log", runs=2)
+    assert len(_builds(out)) == 2
+    assert not (base / ".container-build-fingerprint").exists()
+
+
+@GATE
+def test_build_gate_does_not_record_fingerprint_on_build_failure(tmp_path):
+    """构建失败不能写指纹，否则下一次会误判"代码没变"跳过重建。"""
+    base, log = _fake_repo(tmp_path), tmp_path / "gate.log"
+    out = _run_gate(base, log, env_extra={"UP_BUILD_RC": "1"})
+    assert "rc=1" in out
+    assert not (base / ".container-build-fingerprint").exists()
+
+

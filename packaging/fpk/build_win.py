@@ -47,7 +47,8 @@ EXCLUDE_DIRS = {
     "online_favorites",
 }
 EXCLUDE_SUFFIXES = (".pyc", ".log", ".part")
-EXCLUDE_GLOBS = (".env", "pytest.ini", "CONTRIBUTING.md", "online_favorites.json")
+EXCLUDE_GLOBS = (".env", "pytest.ini", "CONTRIBUTING.md", "online_favorites.json",
+                 ".container-build-fingerprint")
 KEEP_OVERRIDES = {".env.example"}  # rsync --include 优先于后面的 --exclude
 # 打包中间产物 / 临时输出（Windows 侧可能落在仓库根，避免自污染）。
 # 只匹配"点开头或下划线开头的顶层临时物"，不能误伤 __init__.py 之类的源码。

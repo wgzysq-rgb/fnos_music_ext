@@ -5,6 +5,37 @@
 
 ## [Unreleased]
 
+## [2.8.15] - 2026-10-11
+
+### 性能
+
+- **列表页元数据反查：新增进程级索引（P1）**。列表页是**逐条目**按 guid 反查落盘快照
+  与歌单缓存曲目，旧实现每次都把 `play_history` / `online_favorites` / `playlist_tracks` /
+  `recommend_cache` / `nm_playlists_cache` 下的**所有 JSON 读+解析**一遍，整体是
+  O(条目数² × 文件数)。现改为两张进程级索引（`guid → 最佳快照`、`guid → 歌单缓存曲目`），
+  **每次查询只做目录签名（scandir + stat，不读文件内容），签名变了才重建**，热查询降到 O(1)。
+  - 刻意**不用 TTL**：TTL 会让「刚写入就查」读不到新数据（新收藏的歌反查不到元数据）；
+    只 scandir+stat 的成本远低于读+解析全部 JSON，同时保证写后立即可见。
+  - 取值顺序与旧逐条扫描**完全一致**（历史 → 收藏 → 歌单附加；来源内新的在前；同 guid
+    优先真实标题/歌手，占位值不挡真名），并把旧的两个重复实现合并成唯一一份
+    （`_iter_stored_snapshots` 删除），避免两套顺序逻辑各自漂移。
+- **落盘写盘不再阻塞事件循环（P2）**。`stream_tee_response` 与后台整轨下载此前**逐块同步
+  `fp.write`**，边听边存期间会占住事件循环、拖慢同期其它请求。现改为**攒到 1MB 再经
+  `asyncio.to_thread` 写一次**；收尾与中断路径同步 flush 剩余缓冲，保证 part 的字节数与
+  已写计数一致（否则切歌续传会从「还在缓冲里」的偏移续，续出来的文件是错的）。
+- **安装/启动耗时：镜像不再被重复构建**。一次「应用中心安装」会跑两遍
+  `docker compose up -d --build`（`install.sh` 的 `install_sources_container` 一遍，
+  紧接着 `--extend` 链到的 `extend.sh`（`ensure_image_current`）又一遍），每次都要过
+  apt/pip 层，实测各 20~30s；此后每次「应用中心启动」还要再走一遍。
+  新增**构建上下文指纹门禁** `compose_up_build_gated`：只有真正进镜像的文件
+  （与 `.dockerignore` 白名单一致：四个服务目录 + `container/` + `proxy/` 的四个显式模块）
+  或影响镜像层的构建参数（`FNMUSIC_BASE_IMAGE` / `FNMUSIC_PIP_INDEX` / `FNMUSIC_APT_MIRROR`）
+  变了才 `--build`，否则退化为 `up -d`（秒级）。
+  - **fail-open**：指纹算不出来、指纹文件缺失、镜像不存在（`docker rmi`）、跳过路径启动
+    失败，一律回退完整构建——宁可多等 30s，也绝不用旧镜像跑新代码。
+  - 构建失败不写指纹（否则下次会误判「代码没变」跳过重建）。
+  - `proxy/app.py` 只在宿主机跑、不进镜像，它变了**不会**触发容器重建。
+
 ## [2.8.14] - 2026-10-11
 
 ### 修复

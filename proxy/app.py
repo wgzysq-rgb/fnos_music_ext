@@ -3010,6 +3010,8 @@ def ensure_registry_warm() -> None:
         _load_album_registry_persisted()
     except Exception as e:
         logger.debug("album registry restore failed: %s", type(e).__name__)
+    # 顺便预热元数据反查索引（P1）：复用同一批目录，避免首请求冷重建
+    prime_meta_index()
 
 
 def resolve_real_guid(candidate: str) -> str:
@@ -3863,97 +3865,183 @@ async def search_suggest(request: Request):
     return JSONResponse(content=upstream_json, status_code=upstream_resp.status_code, headers=resp_headers)
 
 
-def _iter_stored_snapshots(guid: str):
-    """按 guid 遍历三个本地存储里的落盘快照（优先级：历史 → 收藏 → 歌单附加条目）。
+# === 元数据反查索引（P1 性能优化，2026-10-11） ===
+# 列表页 / 下载元数据回查此前每次按 guid 把 play_history / online_favorites /
+# playlist_tracks / recommend_cache / nmpl 下的**所有 JSON 读+解析**一遍；而列表页是
+# **逐条目**调用 → O(条目数 × 文件数 × 条目数)。这里建「guid→最佳快照」「guid→歌单
+# 缓存曲目」两张进程级索引，热查询降到 O(1)，且不依赖任何写入钩子。
+#
+# 失效策略：**每次查询只做目录签名（scandir+stat，不读文件内容），签名变了才重建**。
+# 不用 TTL——TTL 会让「刚写入就查」读不到新数据；只 scandir+stat 的成本远低于读+解析
+# 全部 JSON，且保证写后立即可见。
+_META_INDEX: dict = {"snapshots": {}, "pltracks": {}, "sig": None}
 
-    快照是「曲目最终 VO」形态（artists 数组、album 对象），调用方一律用 `_tag_fields`
-    取标签，不能 str(album)。
+
+def _meta_snapshot_dirs() -> list[str]:
+    return [dailyrec.play_history_dir(),
+            str(CONF.get("fav_dir") or os.path.join(_HOME, "online_favorites")),
+            plt_dir()]
+
+
+def _meta_pltrack_dirs() -> list[str]:
+    return [dailyrec.recommend_cache_dir(), nmpl.cache_dir()]
+
+
+def _dir_sig(directory: str) -> tuple:
+    """目录签名：一层子目录内 .json 的 (名, 大小, mtime)。任一变化即需重建索引。"""
+    out: list = []
+    try:
+        for e in os.scandir(directory):
+            try:
+                if e.is_dir():
+                    for sub in os.scandir(e.path):
+                        if sub.name.endswith(".json"):
+                            st = sub.stat()
+                            out.append((sub.name, st.st_size, st.st_mtime_ns))
+                elif e.name.endswith(".json"):
+                    st = e.stat()
+                    out.append((e.name, st.st_size, st.st_mtime_ns))
+            except OSError:
+                continue
+    except OSError:
+        pass
+    out.sort()
+    return tuple(out)
+
+
+def _meta_signature() -> tuple:
+    return tuple(_dir_sig(d) for d in (_meta_snapshot_dirs() + _meta_pltrack_dirs()))
+
+
+def _read_json_quiet(path: str):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _iter_snapshot_items(data):
+    """落盘 JSON → 条目，同一用户文件内**新的在前**。
+
+    形状兼容两种：`items` 为 list（播放历史 / 在线收藏，条目按时间追加、最新的在末尾）
+    或 dict-of-buckets（playlist_tracks 的 {"items": {歌单guid: [条目]}}）。
+
+    必须倒序：旧实现逐条扫描时用的是 `reversed(items)`，同 guid 出现多条时取到的是
+    **最新的那条**（历史里可能残留早期占位值、后来才补上真名）。索引按同一顺序重建
+    才能与旧的逐条扫描返回完全一致。
     """
-    # ① 在线播放历史（play_history/<user>.json，条目最新的在末尾，倒序找）
-    try:
-        root = dailyrec.play_history_dir()
-        for name in sorted(os.listdir(root)):
-            if not name.endswith(".json"):
-                continue
-            try:
-                with open(os.path.join(root, name), encoding="utf-8") as f:
-                    data = json.load(f)
-            except Exception:
-                continue
-            items = data.get("items") if isinstance(data, dict) else data
-            if not isinstance(items, list):
-                continue
-            for it in reversed(items):
-                if isinstance(it, dict) and it.get("guid") == guid:
-                    snap = it.get("track") if isinstance(it.get("track"), dict) else None
-                    if snap:
-                        yield snap
-    except OSError:
-        pass
-    # ② 在线收藏（online_favorites/<user>.json，形状同收藏下发条目）
-    try:
-        fav_root = CONF.get("fav_dir") or os.path.join(_HOME, "online_favorites")
-        for name in sorted(os.listdir(fav_root)):
-            if not name.endswith(".json"):
-                continue
-            try:
-                with open(os.path.join(fav_root, name), encoding="utf-8") as f:
-                    data = json.load(f)
-            except Exception:
-                continue
-            items = data.get("items") if isinstance(data, dict) else data
-            if not isinstance(items, list):
-                continue
-            for it in reversed(items):
-                if isinstance(it, dict) and it.get("guid") == guid:
-                    snap = it.get("track") if isinstance(it.get("track"), dict) else None
-                    if snap:
-                        yield snap
-    except OSError:
-        pass
-    # ③ 歌单附加条目（playlist_tracks/<user>.json，{"items": {歌单guid: [条目]}}）：
-    # 只加过歌单、从未收藏/播放的歌也要能反查（官方绑定与 tee 兜底的元数据来源）
-    try:
-        plt_root = plt_dir()
-        for name in sorted(os.listdir(plt_root)):
-            if not name.endswith(".json"):
-                continue
-            try:
-                with open(os.path.join(plt_root, name), encoding="utf-8") as f:
-                    data = json.load(f)
-            except Exception:
-                continue
-            buckets = data.get("items") if isinstance(data, dict) else None
-            if not isinstance(buckets, dict):
-                continue
-            for bucket in buckets.values():
-                if not isinstance(bucket, list):
-                    continue
+    items = data.get("items") if isinstance(data, dict) else data
+    if isinstance(items, list):
+        for it in reversed(items):
+            if isinstance(it, dict):
+                yield it
+    elif isinstance(items, dict):
+        for bucket in items.values():
+            if isinstance(bucket, list):
                 for it in reversed(bucket):
-                    if isinstance(it, dict) and it.get("guid") == guid:
-                        snap = it.get("track") if isinstance(it.get("track"), dict) else None
-                        if snap:
-                            yield snap
-    except OSError:
-        pass
+                    if isinstance(it, dict):
+                        yield it
+
+
+def _rebuild_meta_index() -> None:
+    """重建两张索引，语义与旧的逐条扫描完全一致（两条反查路径的唯一实现）。
+
+    **快照优先级**：来源顺序「播放历史 → 在线收藏 → 歌单附加」；同一来源内新的在前。
+    同 guid 优先取带真实标题/歌手的（历史里可能残留上游占位值的旧快照，不能挡住后面的
+    真名——真名决定曲库文件名与文件标签）；都没有真名时回落到最先遇到的那条（至少能
+    贡献封面）。
+
+    **歌单缓存曲目**：来源顺序「推荐缓存 → 网易歌单缓存」，取首个带标题/歌手的命中
+    （与 `_track_in_list` 同判据）。
+    """
+    snaps: dict = {}
+    real: set = set()
+    for directory in _meta_snapshot_dirs():
+        for path in _iter_registry_jsons(directory):
+            data = _read_json_quiet(path)
+            if data is None:
+                continue
+            for it in _iter_snapshot_items(data):
+                g = str(it.get("guid") or "")
+                snap = it.get("track") if isinstance(it.get("track"), dict) else None
+                if not g or not snap:
+                    continue
+                t, a, _ = _tag_fields(snap)
+                if _is_real_tag(t) or _is_real_tag(a):
+                    if g not in real:
+                        snaps[g] = snap
+                        real.add(g)
+                elif g not in snaps:
+                    snaps[g] = snap
+    pltracks: dict = {}
+    for root in _meta_pltrack_dirs():
+        for path in _iter_registry_jsons(root):
+            data = _read_json_quiet(path)
+            if not isinstance(data, dict):
+                continue
+            for track in (data.get("tracks") or []):
+                if not isinstance(track, dict):
+                    continue
+                g = str(track.get("guid") or "")
+                if not g or g in pltracks:
+                    continue
+                t, a, _ = _tag_fields(track)
+                if t or a:
+                    pltracks[g] = track
+    _META_INDEX["snapshots"] = snaps
+    _META_INDEX["pltracks"] = pltracks
+
+
+
+def prime_meta_index() -> None:
+    """启动时预热索引（避免首请求冷重建）。失败静默。"""
+    try:
+        _rebuild_meta_index()
+        _META_INDEX["sig"] = _meta_signature()
+    except Exception as e:  # noqa: BLE001
+        logger.debug("prime_meta_index failed: %s", e)
+
+
+def reset_meta_index() -> None:
+    """清空索引（测试用；生产靠签名自动失效）。"""
+    _META_INDEX["snapshots"] = {}
+    _META_INDEX["pltracks"] = {}
+    _META_INDEX["sig"] = None
+
+
+def _meta_index() -> dict:
+    """取索引；目录签名变了才重建。
+
+    每次调用都算一次签名（只 scandir+stat，不读文件内容），命中即 O(1) 返回。
+    这样「刚写入就查」也即时可见；重建（读+解析 JSON）只在真有变化时发生。
+    """
+    try:
+        sig = _meta_signature()
+    except Exception:  # noqa: BLE001
+        sig = None
+    if sig is not None and sig != _META_INDEX["sig"]:
+        try:
+            _rebuild_meta_index()
+        except Exception as e:  # noqa: BLE001
+            logger.warning("meta index rebuild failed: %s", e)
+        _META_INDEX["sig"] = sig
+    return _META_INDEX
 
 
 def _lookup_online_snapshot(guid: str) -> "dict | None":
     """按 guid 在落盘快照里反查曲目元数据（issue #28）。
 
-    三个存储都按用户分文件且量小（历史 ≤500 条/用户），tee 转正是低频路径，
-    顺序扫描可接受。**优先返回带真实标题/歌手的快照**：历史里可能残留上游占位值
+    三个存储都按用户分文件且量小（历史 ≤500 条/用户），tee 转正是低频路径。
+    **优先返回带真实标题/歌手的快照**：历史里可能残留上游占位值
     （"未知曲目/未知歌手"）的旧快照，不能让它挡住后面存储里的真名（真名决定曲库
-    文件名与文件标签）；都没有真名时回落到第一个带内容的快照（至少能贡献封面）。
+    文件名与文件标签）；都没有真名时回落到最先遇到的带内容快照（至少能贡献封面）。
+    取值顺序的完整定义与唯一实现见 `_rebuild_meta_index`。
     """
-    fallback: "dict | None" = None
-    for snap in _iter_stored_snapshots(guid):
-        title, artist, _album = _tag_fields(snap)
-        if _is_real_tag(title) or _is_real_tag(artist):
-            return snap
-        if fallback is None:
-            fallback = snap
-    return fallback
+    if not guid:
+        return None
+    # 走进程级索引（P1）：热查询 O(1)，语义与旧逐条扫描完全一致。
+    return _meta_index()["snapshots"].get(str(guid))
 
 
 def _track_in_list(tracks: Any, guid: str) -> dict | None:
@@ -3976,19 +4064,10 @@ def _lookup_playlist_cache_track(guid: str) -> dict | None:
     """
     if not guid:
         return None
-    for root in (dailyrec.recommend_cache_dir(), nmpl.cache_dir()):
-        for path in _iter_registry_jsons(root):
-            try:
-                with open(path, encoding="utf-8") as f:
-                    data = json.load(f)
-            except Exception:
-                continue
-            if not isinstance(data, dict):
-                continue
-            hit = _track_in_list(data.get("tracks"), guid)
-            if hit:
-                return hit
-    return None
+    # 走进程级索引（P1）：按「recommend_cache → nmpl cache」顺序取首个带标题/歌手的
+    # 命中（与 `_track_in_list` 同判据），热查询 O(1)。
+    return _meta_index()["pltracks"].get(str(guid))
+
 
 
 def _merge_missing_tags(title: str, artist: str, album: str, snap: dict) -> tuple[str, str, str]:
@@ -4215,6 +4294,24 @@ def _schedule_library_scan(headers: dict | None) -> None:
     _scan_task = asyncio.create_task(_run())
 
 
+# P2：落盘写改为「攒块 + 线程写」，避免逐块同步写阻塞事件循环（下载期间拖慢其它请求）。
+_DISK_FLUSH_BYTES = 1 << 20  # 1MB
+_DISK_FLUSH_TIMEOUT_S = 30.0
+
+
+async def _flush_disk(fp, buf: bytearray) -> None:
+    """把累积缓冲区写入文件（放在工作线程里，非阻塞事件循环）。"""
+    if not buf:
+        return
+    data = bytes(buf)
+    buf.clear()
+    try:
+        await asyncio.wait_for(asyncio.to_thread(fp.write, data), timeout=_DISK_FLUSH_TIMEOUT_S)
+    except Exception as exc:  # noqa: BLE001
+        # 写盘失败（磁盘满/IO 错误）时按流中断处理，交给上层清理 part
+        raise OSError(f"disk write failed: {exc}") from exc
+
+
 def stream_tee_response(
     resp: httpx.Response,
     guid: str,
@@ -4253,6 +4350,7 @@ def stream_tee_response(
         part = None
         fp = None
         written = 0
+        disk_buf = bytearray()
         eof = False
         info_task = None
         tee_active_token = False
@@ -4270,14 +4368,16 @@ def stream_tee_response(
             iterator = chunks if chunks is not None else resp.aiter_bytes()
             if first_chunk:
                 if fp:
-                    fp.write(first_chunk)
+                    disk_buf += first_chunk
                 written += len(first_chunk)
                 yield first_chunk
             try:
                 async for chunk in iterator:
                     if chunk:
                         if fp:
-                            fp.write(chunk)
+                            disk_buf += chunk
+                            if len(disk_buf) >= _DISK_FLUSH_BYTES:
+                                await _flush_disk(fp, disk_buf)
                         written += len(chunk)
                         yield chunk
             except Exception as exc:
@@ -4290,6 +4390,7 @@ def stream_tee_response(
                 raise
             eof = True
             if fp:
+                await _flush_disk(fp, disk_buf)  # 收尾 flush 剩余缓冲
                 fp.close()
                 fp = None
             if part and eof and written >= 1024 and (expected is None or written == expected):
@@ -4325,6 +4426,14 @@ def stream_tee_response(
                                 pass
         finally:
             if fp:
+                # 中断/关闭路径：同步 flush 剩余缓冲，保证 part 的字节数与 written 一致
+                # （否则切歌续传会从"写在缓冲里"的偏移续，续出来的文件是错的）。
+                if disk_buf:
+                    try:
+                        fp.write(bytes(disk_buf))
+                        disk_buf.clear()
+                    except Exception:  # noqa: BLE001
+                        pass
                 fp.close()
                 fp = None
             resume_part = None
@@ -4712,14 +4821,18 @@ async def _full_fetch_download(guid: str, cred_headers: dict, force_mp3: bool = 
         os.makedirs(directory, exist_ok=True)
         part = os.path.join(directory, f"{cache_safe_guid(guid)}.{uuid4().hex}.part")
         written = 0
+        buf = bytearray()
         with open(part, "wb") as fp:
             if first:
-                fp.write(first)
+                buf += first
                 written += len(first)
             async for chunk in chunks:
                 if chunk:
-                    fp.write(chunk)
+                    buf += chunk
                     written += len(chunk)
+                    if len(buf) >= _DISK_FLUSH_BYTES:
+                        await _flush_disk(fp, buf)  # 攒块线程写，别阻塞事件循环
+            await _flush_disk(fp, buf)
         if written < 1024 or (expected is not None and written != expected):
             raise RuntimeError(f"size mismatch written={written} expected={expected}")
         info = await _info_for_background_save(fake_request, guid, info)

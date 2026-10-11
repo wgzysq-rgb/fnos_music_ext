@@ -1143,9 +1143,8 @@ install_sources_container() {
     else
         reclaim_container "${CONTAINER_NAME}" || return 1
     fi
-    # issue #24：构建日志逐层可见（非 tty 下默认进度条会被压成静默，看似"卡在 55%"）
-    export BUILDKIT_PROGRESS="${BUILDKIT_PROGRESS:-plain}"
-    if ! run_docker compose -f "${BASE_DIR}/docker-compose.yml" up -d --build; then
+    # 构建门禁（proxy/install_common.sh）：上下文未变则跳过镜像重建，直接 up -d
+    if ! compose_up_build_gated; then
         log_err "Docker 镜像构建或启动失败（compose up --build）。"
         log_err "构建期会依次尝试多个国内 apt/pip 镜像源；若仍失败，通常是构建容器整体无法外网访问。"
         log_err "排查步骤（按序）："
