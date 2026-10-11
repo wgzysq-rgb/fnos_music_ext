@@ -4393,6 +4393,14 @@ async def _recover_source(request: Request, guid: str, entry: dict | None) -> bo
         _FETCH_SCOPE.reset(token)
 
 
+# 洛雪直链多走各平台 CDN；部分（如酷我 kuwo）会反爬非浏览器 UA。流式下发
+# 必须带浏览器标识，否则取流被拒、App 跳曲（bug B 根因，2026-10-11 实锤）。
+_BROWSER_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/128.0 Safari/537.36"
+)
+
+
 async def _open_online_stream(request: Request, guid: str, range_header: str | None,
                               force_mp3: bool = False):
     """Resolve and read first bytes before committing HTTP headers to the client."""
@@ -4420,6 +4428,12 @@ async def _open_online_stream(request: Request, guid: str, range_header: str | N
                 for key, value in (resolved.get("headers") or {}).items():
                     if key.lower() in ("referer", "user-agent"):
                         headers[key] = str(value)
+                # bug B 修复：resolved 未返回 UA/Referer（kw 即如此）时，流式 fetch
+                # 默认用 httpx UA 被 kuwo 反爬拦掉 → 取流失败 → App 跳曲。统一补浏览器
+                # 标识，与代理封面段 kuwo headers 保持同款（见 proxy/app.py:6240）。
+                headers.setdefault("User-Agent", _BROWSER_UA)
+                if song_id_from_online_guid(guid).startswith("lx:kw"):
+                    headers.setdefault("Referer", "https://www.kuwo.cn/")
             if info is None:
                 try:
                     info = await asyncio.wait_for(_fetch_online_info(request, guid), timeout=0.75)

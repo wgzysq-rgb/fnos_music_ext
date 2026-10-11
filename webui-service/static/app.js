@@ -23,6 +23,9 @@ const state = {
 
 let configValues = {};   // GET /api/config 的 values
 let platforms = { enabled: [], registered: [] };
+// 当前洛雪源实际支持的平台 code 列表（来自 /api/status 的 lx_source.source.platforms）。
+// null = 尚未拿到源信息（非 lx 提供方 / 状态未加载）——此时推荐平台勾选框回退全量展示。
+let lxSupported = null;
 let dirty = false;
 let qrTimer = null;
 let lxVerifiedUrl = null; // 已通过测试的 lx URL（保存时免二次校验提示用）
@@ -89,6 +92,7 @@ async function loadStatus() {
     if (st.current_provider === "lxmusic" && st.lx_source) {
       lxCard.hidden = false;
       const s = st.lx_source.source;
+      lxSupported = s ? Object.keys(s.platforms || {}) : [];
       const rows = [];
       rows.push(`<div class="kv"><b>状态</b>${st.lx_source.initialized ? "已加载" : "未加载"}</div>`);
       if (s) {
@@ -100,7 +104,9 @@ async function loadStatus() {
       $("#ov-lx").innerHTML = rows.join("");
     } else {
       lxCard.hidden = true;
+      lxSupported = null;
     }
+    renderSourceChips();  // 用最新源支持信息重绘推荐平台勾选框（隐藏源不支持的平台）
   } catch (exc) {
     $("#ov-provider-body").textContent = "状态加载失败：" + exc.message;
   }
@@ -347,11 +353,21 @@ function updatePlaylistDetailVisibility() {
   wrap.style.display = sw.checked ? "" : "none";
 }
 
+function visiblePlaylistPlatforms() {
+  // 仅展示当前洛雪源实际支持的平台（来自 /api/status 的 lx_source.source.platforms）；
+  // null/空 表示尚未拿到源信息（非 lx 提供方 / 状态未加载）——回退全量展示。
+  if (lxSupported && lxSupported.length) {
+    return ALL_PLATFORMS.filter((p) => lxSupported.includes(p));
+  }
+  return ALL_PLATFORMS;
+}
+
 function renderSourceChips() {
   const box = $("#playlist-source-chips");
   if (!box) return;
   const on = new Set(state.playlistSource);
-  box.innerHTML = ALL_PLATFORMS
+  const visible = visiblePlaylistPlatforms();
+  box.innerHTML = visible
     .map((p) => `<span class="chip ${on.has(p) ? "on" : ""}" data-src="${p}">${PLATFORM_LABEL[p]}<small>${p}</small></span>`)
     .join("");
   box.querySelectorAll(".chip[data-src]").forEach((chip) =>
@@ -359,7 +375,7 @@ function renderSourceChips() {
       const p = chip.dataset.src;
       const set = new Set(state.playlistSource);
       if (set.has(p)) set.delete(p); else set.add(p);
-      state.playlistSource = ALL_PLATFORMS.filter((x) => set.has(x));
+      state.playlistSource = visible.filter((x) => set.has(x));
       // 取消平台时，顺手清掉该平台已选分类，避免残留无效配置
       if (!set.has(p)) {
         state.playlistCategory = state.playlistCategory.filter((c) => !c.startsWith(p + ":"));
@@ -368,6 +384,14 @@ function renderSourceChips() {
       renderCategoryChips();
       markDirty("平台歌单已修改");
     }));
+  // 提示：被当前音源不支持而隐藏的平台（如 mg），避免用户误勾导致静默失败
+  const hintEl = $("#playlist-source-hint");
+  if (hintEl) {
+    const hidden = ALL_PLATFORMS.filter((p) => !visible.includes(p));
+    hintEl.textContent = hidden.length
+      ? `当前洛雪源不支持 ${hidden.map((p) => PLATFORM_LABEL[p] || p).join("、")}，已自动隐藏（勾了也不会注入）。`
+      : "勾选要注入的平台（至少选 1 个）。一个都不勾选 = 不注入任何推荐歌单。";
+  }
 }
 
 async function ensureCategoryData() {

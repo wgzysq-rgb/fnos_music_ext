@@ -5,6 +5,31 @@
 
 ## [Unreleased]
 
+## [2.8.7] - 2026-10-11
+
+### 修复
+
+- **酷我（kw）在线曲目在飞牛 App 里一播就跳下一首（bug B，根因实锤并修复）**。
+  - 根因：解析与直链都正常（`docker logs` 全 200、背靠背直拉下满 46MB 已验证），
+    但代理把音频流推给 App 那一步（`proxy/app.py::_open_online_stream` 的 lx 分支）
+    只搬 `resolved["headers"]` 里的 referer/user-agent，而 **kw 的 resolved headers 为空**，
+    流式 `build_request` 的 UA 是 httpx 默认 → **kuwo CDN 反爬挡非浏览器 UA** →
+    取流校验不通过 → `_open_online_stream` 返回 None → App 跳曲。tx/kg 的 CDN 不挡
+    httpx 默认 UA，故正常（这也解释了为什么只有酷我坏）。
+  - 修复：lx 分支流式 fetch 前统一补浏览器 `User-Agent`，并对 kw 额外补
+    `Referer: https://www.kuwo.cn/`（与代理封面段 kuwo headers 同款，见 `proxy/app.py:6240`）。
+    属服务端改动、不依赖 App，低风险。
+  - 注：若某 kw 曲目在源侧本身就是「试听源」、给不出可播直链，仍会失败——那是源本身
+    限制，非代码可补；本次修复让**能出链的 kw 曲目**可正常播放。
+
+- **设置页「平台歌单·启用平台」改为按音源实际支持动态过滤**。
+  - 此前该勾选框的 5 个平台（QQ音乐/网易云/酷我/酷狗/咪咕）是 `app.js` 里写死的
+    `ALL_PLATFORMS` 常量，**不读音源 `supportedSources`**。导致音源（如 ikun）根本不支持
+    mg 时，UI 仍展示 mg 勾选项，用户勾了只会让代理静默注入失败。
+  - 修复：`renderSourceChips` 现在按 `/api/status` 返回的 `lx_source.source.platforms`
+    （音源真支持平台）过滤，隐藏不支持的平台并给出提示；无源信息时回退全量展示。
+    纯前端改动，不依赖后端协议变更。
+
 ## [2.8.6] - 2026-10-11
 
 ### 修复
